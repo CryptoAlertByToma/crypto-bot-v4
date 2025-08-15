@@ -14,60 +14,50 @@ from typing import Dict, List, Optional
 import feedparser
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
-
-# FLASK KEEP-ALIVE POUR RENDER
 from flask import Flask
-app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return f"""
-    🚀 BOT CRYPTO V4.0 ACTIF !
-    ⏰ Dernière activité: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
-    📊 Status: En fonctionnement
-    🤖 Rapports quotidiens: 08:00 Paris
-    📰 News crypto: Toutes les 30min
-    """
-
-@app.route('/status')
-def status():
-    return {
-        "status": "active",
-        "time": datetime.now().isoformat(),
-        "bot": "crypto_v4_final"
-    }
-
-def run_flask():
-    """Lance Flask en arrière-plan"""
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-
-# === CONFIGURATION FINALE V4.0 ===
-TOKEN = "8050724073:AAHugCqSuHUWPOJXJUFoH7TlEptW_jB-790"
-CHAT_ID = 5926402259
-DAILY_REPORT_TIME = "08:00"
-NEWS_INTERVAL = 1800
-CLEANUP_DAYS = 30
+# === CONFIGURATION RENDER - VARIABLES D'ENVIRONNEMENT ===
+TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8050724073:AAHugCqSuHUWPOJXJUFoH7TlEptW_jB-790')
+CHAT_ID = int(os.environ.get('CHAT_ID', '5926402259'))
+DAILY_REPORT_TIME = os.environ.get('DAILY_REPORT_TIME', '08:00')
+NEWS_INTERVAL = int(os.environ.get('NEWS_INTERVAL', '1800'))
+CLEANUP_DAYS = int(os.environ.get('CLEANUP_DAYS', '30'))
 
 # HORAIRES ÉCONOMIQUES PRÉCIS
 CPI_PPI_TIME = "14:30"
 FOMC_TIME = "20:00"
 NFP_TIME = "14:30"
 
-# VOS APIS RÉELLES
-FRED_API_KEY = "3ea743e6a3f7e68cf9c09654f1a539ee"
-COINGLASS_API_KEY = "639799dcedb04a72b4a296bbe49616b9"
-COINGLASS_NEW_API = "f8ca50e46d2e460eb4465a754fb9a9bf"
-ALPHA_VANTAGE_KEY = "4J51YB27HHDW6X62"
-MESSARI_API_KEY = "gxyv6ix-A5l4qJfo2zRmLHQMvi82zTKiN23rrzsPerS0QmPI"
+# APIS DEPUIS VARIABLES D'ENVIRONNEMENT
+FRED_API_KEY = os.environ.get('FRED_API_KEY', '3ea743e6a3f7e68cf9c09654f1a539ee')
+COINGLASS_API_KEY = os.environ.get('COINGLASS_API_KEY', '639799dcedb04a72b4a296bbe49616b9')
+COINGLASS_NEW_API = os.environ.get('COINGLASS_NEW_API', 'f8ca50e46d2e460eb4465a754fb9a9bf')
+ALPHA_VANTAGE_KEY = os.environ.get('ALPHA_VANTAGE_KEY', '4J51YB27HHDW6X62')
+MESSARI_API_KEY = os.environ.get('MESSARI_API_KEY', 'gxyv6ix-A5l4qJfo2zRmLHQMvi82zTKiN23rrzsPerS0QmPI')
 
-# Configuration logging pour Render
+# Configuration logging pour Render (console seulement)
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]  # Logs vers console pour Render
+    handlers=[logging.StreamHandler()],
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# === FLASK KEEP-ALIVE POUR RENDER ===
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "🚀 BOT CRYPTO V4.0 ACTIF !"
+
+@app.route('/status')
+def status():
+    return {"status": "active", "time": datetime.now().isoformat()}
+
+def run_flask():
+    """Lance Flask en arrière-plan"""
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
 
 class DatabaseManager:
     def __init__(self, db_path="crypto_bot_v4_final.db"):
@@ -552,6 +542,125 @@ class ReportGenerator:
             
             # Analyse momentum
             momentum = "haussier" if data['change_24h'] > 0 else "baissier"
+            momentum_strength = "fort" if abs(data['change_24h']) > 3 else "modéré"
+            
+            # Analyse flux
+            flow_analysis = "ACCUMULATION" if data['net_flow'] > 0 else "DISTRIBUTION"
+            flow_emoji = "🟢" if data['net_flow'] > 0 else "🔴"
+            
+            # Signal confluence
+            confluence_signals = []
+            if data['change_24h'] < -3 and data['price'] < data['support'] * 1.02:
+                confluence_signals.append("Support test")
+            if data['net_flow'] > 50:
+                confluence_signals.append("Accumulation forte")
+            if data['liquidations_long'] > data['liquidations_short'] * 2:
+                confluence_signals.append("Long squeeze")
+            
+            signal_confluence = " + ".join(confluence_signals) if confluence_signals else "Signaux neutres"
+            
+            # Rapport enrichi
+            report = f"""{emoji} **{name.upper()} TRADING ANALYSIS**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💰 **PRIX & PERFORMANCE**
+• Prix: ${data['price']:,.2f}
+• 24h: {data['change_24h']:+.2f}%
+• Volume 24h: ${data['volume_24h']/1_000_000_000:.1f}B
+• Market Cap: ${data['market_cap']/1_000_000_000:.0f}B
+
+💀 **LIQUIDATIONS 24H (CoinGlass)**
+• Longs liquidés: ${data['liquidations_long']:.0f}M
+• Shorts liquidés: ${data['liquidations_short']:.0f}M
+• Total liquidations: ${data['liquidations_total']:.0f}M
+• Plus grosse liqui: ${data['liquidations_total']*0.15:.1f}M
+
+📊 **ANALYSE TECHNIQUE**
+• Support: ${data['support']:,.0f}
+• Résistance: ${data['resistance']:,.0f}
+• MA50: ${data['ma50']:,.0f}
+• MA200: ${data['ma200']:,.0f}
+
+💎 **FLUX ON-CHAIN (24h)**
+• Entrées exchanges: {data['exchange_inflow']:+.0f}M {"🟢" if data['exchange_inflow'] < 0 else "🔴"}
+• Sorties exchanges: {data['exchange_outflow']:+.0f}M {"🔴" if data['exchange_outflow'] > 0 else "🟢"}
+• Flux net: {data['net_flow']:+.0f}M {flow_emoji} ({flow_analysis})
+
+🔗 **DONNÉES ON-CHAIN**
+• Adresses actives: {data['active_addresses']:,}
+• Transactions: {data['transactions_24h']:,}
+
+📈 **MOMENTUM**: {momentum_strength.capitalize()} {momentum} ({data['change_24h']:+.1f}%)
+🎯 **CONFLUENCE**: {signal_confluence}
+
+⏰ Généré: {datetime.now().strftime('%d/%m/%Y à %H:%M')} - V4.0"""
+            
+            # Sauvegarde en DB
+            await self.save_enriched_data(symbol, data)
+            
+            return report
+            
+        except Exception as e:
+            logger.error(f"❌ Erreur rapport enrichi {symbol}: {e}")
+            return f"❌ Erreur rapport {name}: {str(e)[:100]}"
+    
+    async def generate_eurusd_report(self) -> str:
+        """Rapport EUR/USD enrichi"""
+        try:
+            # Récupération données
+            data = await self.data_provider.get_eurusd_data()
+            
+            # Analyse momentum
+            momentum = "haussier" if data['change_24h'] > 0 else "baissier"
+            
+            # RAPPORT ENRICHI
+            report = f"""💱 **EUR/USD TRADING ANALYSIS**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💰 **TAUX & PERFORMANCE**
+• Taux: {data['rate']:.5f}
+• 24h: {data['change_24h']:+.2f}%
+• High 24h: {data['high_24h']:.5f}
+• Low 24h: {data['low_24h']:.5f}
+
+📊 **NIVEAUX TECHNIQUES**
+• Support: {data['rate'] * 0.995:.5f}
+• Résistance: {data['rate'] * 1.008:.5f}
+• Range 24h: {((data['high_24h'] - data['low_24h']) * 10000):.0f} pips
+
+💡 **ANALYSE**: EUR strength vs USD
+📈 **MOMENTUM**: {momentum.capitalize()} confirmé ({data['change_24h']:+.2f}%)
+
+🇪🇺 **FACTEURS EUR:**
+• BCE moins hawkish que prévu
+• Données économiques européennes solides
+• Flux capitaux vers EUR
+
+🇺🇸 **FACTEURS USD:**
+• FED pause probable
+• Données emploi US mitigées
+• Tensions géopolitiques modérées
+
+💎 **NIVEAUX CLÉS:**
+• Support majeur: {data['rate'] * 0.985:.5f}
+• Résistance critique: {data['rate'] * 1.015:.5f}
+
+⏰ Généré: {datetime.now().strftime('%d/%m/%Y à %H:%M')} - V4.0"""
+            
+            return report
+            
+        except Exception as e:
+            logger.error(f"❌ Erreur rapport EUR/USD: {e}")
+            return "❌ Erreur rapport EUR/USD"
+    
+    async def generate_gold_report(self) -> str:
+        """Rapport Gold enrichi"""
+        try:
+            # Récupération données
+            data = await self.data_provider.get_gold_data()
+            
+            # Analyse momentum
+            momentum = "haussier" if data['change_24h'] > 0 else "baissier"
             momentum_strength = "fort" if abs(data['change_24h']) > 1 else "modéré"
             
             # RAPPORT ENRICHI
@@ -749,7 +858,7 @@ class TelegramPublisher:
 🚀 **BOT CRYPTO V4.0 FINAL - DONNÉES ENRICHIES** 🚀
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-✅ **VERSION PRODUCTION ACTIVÉE SUR RENDER**
+✅ **VERSION PRODUCTION ACTIVÉE**
 ⏰ {datetime.now().strftime('%d/%m/%Y à %H:%M')}
 
 {calendar_summary}
@@ -829,20 +938,27 @@ class TelegramPublisher:
 📊 **RÉSUMÉ QUOTIDIEN V4.0 - {datetime.now().strftime('%d/%m/%Y')}**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-✅ **5 RAPPORTS ENRICHIS ENVOYÉS DEPUIS RENDER**
+✅ **5 RAPPORTS ENRICHIS ENVOYÉS**
 • 🟠 Bitcoin avec liquidations CoinGlass + flux on-chain + confluence
 • 🔷 Ethereum avec liquidations CoinGlass + flux on-chain + confluence
 • 🟣 Solana avec liquidations CoinGlass + flux on-chain + confluence
 • 💱 EUR/USD avec niveaux techniques (prix corrigé: ~1.166)
 • 🥇 Gold avec analyse technique/fondamentale (prix corrigé: ~$3,341)
 
-🌐 **HÉBERGEMENT RENDER ACTIF 24/7**
+🎯 **NOUVELLES DONNÉES INTÉGRÉES**
+• 💀 Liquidations 24H via CoinGlass (Longs/Shorts/Total)
+• 💎 Flux on-chain (Entrées/Sorties exchanges + Net flow)
+• 📊 Support/Résistance/MA50/MA200 calculés
+• 🔗 Données on-chain (Adresses actives, Transactions)
+• 📈 Analyse confluence multi-indicateurs
+• ❌ RSI supprimé (était non fiable)
+
 📈 **Prochains rapports: {DAILY_REPORT_TIME} demain**
 🚨 **Alertes Trump actives 24/7**
 📰 **News crypto importantes en continu**
 📅 **Calendrier économique intégré**
 
-🔥 **VERSION ENRICHIE V4.0 HÉBERGÉE !**
+🔥 **VERSION ENRICHIE V4.0 SANS RSI BIDON !**
             """
             
             await self.bot.send_message(
@@ -851,7 +967,7 @@ class TelegramPublisher:
                 parse_mode='Markdown'
             )
             
-            logger.info("📊 5 rapports enrichis envoyés avec succès depuis Render")
+            logger.info("📊 5 rapports enrichis envoyés avec succès")
             
         except Exception as e:
             logger.error(f"❌ Erreur envoi rapports enrichis: {e}")
@@ -966,13 +1082,13 @@ class TelegramPublisher:
             conn.close()
             
             if news_items:
-                logger.info(f"📰 {len(news_items)} news envoyées depuis Render")
+                logger.info(f"📰 {len(news_items)} news envoyées")
             
         except Exception as e:
             logger.error(f"❌ Erreur envoi news: {e}")
 
 class FinalCryptoBotV4:
-    """Bot Crypto V4.0 FINAL avec données enrichies pour Render"""
+    """Bot Crypto V4.0 FINAL avec données enrichies sans RSI"""
     def __init__(self):
         self.db = DatabaseManager()
         self.translator = NewsTranslator(self.db)
@@ -1027,18 +1143,18 @@ class FinalCryptoBotV4:
             logger.error(f"❌ Erreur vérification événements: {e}")
     
     async def scheduled_tasks(self):
-        """Boucle principale V4.0 pour Render"""
-        logger.info("🚀 Bot Crypto V4.0 FINAL - Démarrage sur Render")
+        """Boucle principale V4.0 avec données enrichies"""
+        logger.info("🚀 Bot Crypto V4.0 FINAL - Données Enrichies Sans RSI")
         
         # Message de démarrage
         startup_msg = f"""
-🌐 **BOT CRYPTO V4.0 DÉPLOYÉ SUR RENDER !** 🌐
+🚀 **BOT CRYPTO V4.0 FINAL - DONNÉES ENRICHIES** 🚀
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-✅ **HÉBERGEMENT ACTIF 24/7**
+✅ **VERSION PRODUCTION ACTIVÉE**
 ⏰ {datetime.now().strftime('%d/%m/%Y à %H:%M')}
 
-🎯 **FONCTIONNALITÉS ACTIVES:**
+🎯 **NOUVELLES FONCTIONNALITÉS:**
 • 💀 Liquidations CoinGlass (Longs/Shorts/Total)  
 • 💎 Flux on-chain (Entrées/Sorties exchanges)
 • 📊 Support/Résistance calculés précisément
@@ -1047,13 +1163,13 @@ class FinalCryptoBotV4:
 • 📅 Calendrier économique intégré
 • 🚨 Alertes pré-événements économiques
 • 💰 Prix réels corrigés (EUR/USD ~1.166, Gold ~$3,341)
+• ❌ RSI supprimé (était non fiable)
 
-🌐 **HÉBERGEMENT GRATUIT RENDER**
-📊 **Rapports quotidiens: {DAILY_REPORT_TIME}**
-📰 **News crypto: Toutes les 30min**
-🚨 **Alertes Trump: Temps réel**
+📊 **RAPPORTS ENRICHIS:**
+• BTC/ETH/SOL: Liquidations + Flux + Support/Résistance + Confluence
+• EUR/USD/Gold: Niveaux techniques + Facteurs macro/fondamentaux
 
-🔥 **PREMIÈRE SÉRIE DE RAPPORTS DANS 10 SECONDES !**
+🔥 **PREMIÈRE SÉRIE DE RAPPORTS ENRICHIS DANS 10 SECONDES !**
         """
         
         await self.publisher.bot.send_message(chat_id=CHAT_ID, text=startup_msg.strip(), parse_mode='Markdown')
@@ -1091,7 +1207,7 @@ class FinalCryptoBotV4:
         await self.publisher.send_news()
     
     async def run(self):
-        """Lance le bot V4.0 sur Render"""
+        """Lance le bot V4.0"""
         try:
             await self.scheduled_tasks()
         except KeyboardInterrupt:
@@ -1102,149 +1218,31 @@ class FinalCryptoBotV4:
             await self.run()
 
 # === FONCTION PRINCIPALE POUR RENDER ===
-async def run_bot():
-    """Lance le bot crypto"""
-    try:
-        logger.info("🚀 Démarrage Bot Crypto V4.0 sur Render")
-        bot = FinalCryptoBotV4()
-        await bot.run()
-    except Exception as e:
-        logger.error(f"❌ Erreur critique bot: {e}")
-        await asyncio.sleep(60)
-        await run_bot()  # Restart automatique
-
 def main():
     """Point d'entrée principal pour Render"""
     try:
-        # Démarrer Flask en arrière-plan
+        # Lance Flask en arrière-plan
         flask_thread = threading.Thread(target=run_flask, daemon=True)
         flask_thread.start()
-        logger.info("✅ Serveur Flask démarré")
+        logger.info("✅ Flask keep-alive démarré")
         
-        # Démarrer le bot crypto
-        asyncio.run(run_bot())
+        # Lance le bot
+        bot = FinalCryptoBotV4()
+        asyncio.run(bot.run())
         
+    except KeyboardInterrupt:
+        logger.info("🛑 Arrêt manuel")
     except Exception as e:
-        logger.error(f"❌ Erreur main: {e}")
+        logger.error(f"❌ Erreur critique: {e}")
+        time.sleep(60)
+        main()  # Restart automatique
 
 if __name__ == "__main__":
-    main() = "fort" if abs(data['change_24h']) > 3 else "modéré"
-            
-            # Analyse flux
-            flow_analysis = "ACCUMULATION" if data['net_flow'] > 0 else "DISTRIBUTION"
-            flow_emoji = "🟢" if data['net_flow'] > 0 else "🔴"
-            
-            # Signal confluence
-            confluence_signals = []
-            if data['change_24h'] < -3 and data['price'] < data['support'] * 1.02:
-                confluence_signals.append("Support test")
-            if data['net_flow'] > 50:
-                confluence_signals.append("Accumulation forte")
-            if data['liquidations_long'] > data['liquidations_short'] * 2:
-                confluence_signals.append("Long squeeze")
-            
-            signal_confluence = " + ".join(confluence_signals) if confluence_signals else "Signaux neutres"
-            
-            # Rapport enrichi
-            report = f"""{emoji} **{name.upper()} TRADING ANALYSIS**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💰 **PRIX & PERFORMANCE**
-• Prix: ${data['price']:,.2f}
-• 24h: {data['change_24h']:+.2f}%
-• Volume 24h: ${data['volume_24h']/1_000_000_000:.1f}B
-• Market Cap: ${data['market_cap']/1_000_000_000:.0f}B
-
-💀 **LIQUIDATIONS 24H (CoinGlass)**
-• Longs liquidés: ${data['liquidations_long']:.0f}M
-• Shorts liquidés: ${data['liquidations_short']:.0f}M
-• Total liquidations: ${data['liquidations_total']:.0f}M
-• Plus grosse liqui: ${data['liquidations_total']*0.15:.1f}M
-
-📊 **ANALYSE TECHNIQUE**
-• Support: ${data['support']:,.0f}
-• Résistance: ${data['resistance']:,.0f}
-• MA50: ${data['ma50']:,.0f}
-• MA200: ${data['ma200']:,.0f}
-
-💎 **FLUX ON-CHAIN (24h)**
-• Entrées exchanges: {data['exchange_inflow']:+.0f}M {"🟢" if data['exchange_inflow'] < 0 else "🔴"}
-• Sorties exchanges: {data['exchange_outflow']:+.0f}M {"🔴" if data['exchange_outflow'] > 0 else "🟢"}
-• Flux net: {data['net_flow']:+.0f}M {flow_emoji} ({flow_analysis})
-
-🔗 **DONNÉES ON-CHAIN**
-• Adresses actives: {data['active_addresses']:,}
-• Transactions: {data['transactions_24h']:,}
-
-📈 **MOMENTUM**: {momentum_strength.capitalize()} {momentum} ({data['change_24h']:+.1f}%)
-🎯 **CONFLUENCE**: {signal_confluence}
-
-⏰ Généré: {datetime.now().strftime('%d/%m/%Y à %H:%M')} - V4.0"""
-            
-            # Sauvegarde en DB
-            await self.save_enriched_data(symbol, data)
-            
-            return report
-            
-        except Exception as e:
-            logger.error(f"❌ Erreur rapport enrichi {symbol}: {e}")
-            return f"❌ Erreur rapport {name}: {str(e)[:100]}"
+    try:
+        import telegram
+        logger.info("✅ Module telegram OK")
+    except ImportError:
+        logger.error("❌ Installez: pip install python-telegram-bot")
+        exit(1)
     
-    async def generate_eurusd_report(self) -> str:
-        """Rapport EUR/USD enrichi"""
-        try:
-            # Récupération données
-            data = await self.data_provider.get_eurusd_data()
-            
-            # Analyse momentum
-            momentum = "haussier" if data['change_24h'] > 0 else "baissier"
-            
-            # RAPPORT ENRICHI
-            report = f"""💱 **EUR/USD TRADING ANALYSIS**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💰 **TAUX & PERFORMANCE**
-• Taux: {data['rate']:.5f}
-• 24h: {data['change_24h']:+.2f}%
-• High 24h: {data['high_24h']:.5f}
-• Low 24h: {data['low_24h']:.5f}
-
-📊 **NIVEAUX TECHNIQUES**
-• Support: {data['rate'] * 0.995:.5f}
-• Résistance: {data['rate'] * 1.008:.5f}
-• Range 24h: {((data['high_24h'] - data['low_24h']) * 10000):.0f} pips
-
-💡 **ANALYSE**: EUR strength vs USD
-📈 **MOMENTUM**: {momentum.capitalize()} confirmé ({data['change_24h']:+.2f}%)
-
-🇪🇺 **FACTEURS EUR:**
-• BCE moins hawkish que prévu
-• Données économiques européennes solides
-• Flux capitaux vers EUR
-
-🇺🇸 **FACTEURS USD:**
-• FED pause probable
-• Données emploi US mitigées
-• Tensions géopolitiques modérées
-
-💎 **NIVEAUX CLÉS:**
-• Support majeur: {data['rate'] * 0.985:.5f}
-• Résistance critique: {data['rate'] * 1.015:.5f}
-
-⏰ Généré: {datetime.now().strftime('%d/%m/%Y à %H:%M')} - V4.0"""
-            
-            return report
-            
-        except Exception as e:
-            logger.error(f"❌ Erreur rapport EUR/USD: {e}")
-            return "❌ Erreur rapport EUR/USD"
-    
-    async def generate_gold_report(self) -> str:
-        """Rapport Gold enrichi"""
-        try:
-            # Récupération données
-            data = await self.data_provider.get_gold_data()
-            
-            # Analyse momentum
-            momentum = "haussier" if data['change_24h'] > 0 else "baissier"
-            momentum_strength
+    main()
