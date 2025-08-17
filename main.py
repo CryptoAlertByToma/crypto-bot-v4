@@ -21,7 +21,7 @@ from flask import Flask
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8050724073:AAHugCqSuHUWPOJXJUFoH7TlEptW_jB-790')
 CHAT_ID = int(os.environ.get('CHAT_ID', '5926402259'))
 DAILY_REPORT_TIME = os.environ.get('DAILY_REPORT_TIME', '08:00')
-NEWS_INTERVAL = int(os.environ.get('NEWS_INTERVAL', '3600'))  # 1h au lieu de 30min
+NEWS_INTERVAL = int(os.environ.get('NEWS_INTERVAL', '14400'))  # 4h au lieu de 2h
 CLEANUP_DAYS = int(os.environ.get('CLEANUP_DAYS', '30'))
 
 # APIS DEPUIS VARIABLES D'ENVIRONNEMENT
@@ -44,15 +44,16 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🚀 BOT CRYPTO V4.0 ACTIF - RAPPORTS 8H00 GARANTIS !"
+    return "🚀 BOT CRYPTO V4.0 GROUPÉ - RAPPORTS 8H00 + TRUMP ALERTS !"
 
 @app.route('/status')
 def status():
-    return {"status": "active", "time": datetime.now().isoformat(), "reports": "8h00 daily"}
+    return {"status": "active", "time": datetime.now().isoformat(), "reports": "8h00 daily grouped"}
 
 # Variables globales
 dernier_rapport_envoye = None
 bot_instance = None
+last_trump_alert = None
 
 class DatabaseManager:
     def __init__(self, db_path="crypto_bot_v4_final.db"):
@@ -301,9 +302,7 @@ class DataProvider:
     async def get_eurusd_data(self) -> Dict:
         """Données EUR/USD - Prix réalistes"""
         try:
-            # Simulation avec prix réels
             return {'rate': 1.16600, 'change_24h': 0.35, 'high_24h': 1.17300, 'low_24h': 1.16000}
-            
         except Exception as e:
             logger.error(f"❌ Erreur EUR/USD: {e}")
             return {'rate': 1.16600, 'change_24h': 0.35, 'high_24h': 1.17300, 'low_24h': 1.16000}
@@ -311,9 +310,7 @@ class DataProvider:
     async def get_gold_data(self) -> Dict:
         """Données Gold - Prix réalistes"""
         try:
-            # Simulation avec vrais prix
             return {'price': 3341.38, 'change_24h': 1.60, 'high_24h': 3358.50, 'low_24h': 3324.20}
-            
         except Exception as e:
             logger.error(f"❌ Erreur Gold: {e}")
             return {'price': 3341.38, 'change_24h': 1.60, 'high_24h': 3358.50, 'low_24h': 3324.20}
@@ -346,7 +343,7 @@ class DataProvider:
         return {**base_data, **liquidations, **onchain_data, **support_resistance}
 
 class ReportGenerator:
-    """Générateur de rapports enrichis"""
+    """Générateur de rapports enrichis GROUPÉS"""
     def __init__(self, db_manager):
         self.db = db_manager
         self.data_provider = DataProvider(db_manager)
@@ -355,332 +352,107 @@ class ReportGenerator:
     def is_forex_market_open(self) -> bool:
         """Vérifie si les marchés Forex/Gold sont ouverts"""
         now = datetime.now()
-        weekday = now.weekday()  # 0=Lundi, 6=Dimanche
+        weekday = now.weekday()
         
-        # Weekend = marchés fermés
-        if weekday >= 5:  # Samedi (5) ou Dimanche (6)
+        if weekday >= 5:
             return False
         
-        # Vendredi après 22h = marché fermé
         if weekday == 4 and now.hour >= 22:
             return False
         
         return True
     
-    async def generate_crypto_report_enriched(self, symbol: str, name: str, emoji: str) -> str:
-        """Rapport crypto enrichi avec toutes les données"""
+    async def generate_crypto_grouped_report(self) -> str:
+        """Rapport crypto groupé (3 en 1)"""
         try:
-            data = await self.data_provider.get_crypto_data_enriched(symbol)
+            btc_data = await self.data_provider.get_crypto_data_enriched('bitcoin')
+            eth_data = await self.data_provider.get_crypto_data_enriched('ethereum')
+            sol_data = await self.data_provider.get_crypto_data_enriched('solana')
             
-            if not data or data['price'] == 0:
-                return f"❌ Données indisponibles pour {name}"
-            
-            # Analyse momentum
-            momentum = "haussier" if data['change_24h'] > 0 else "baissier"
-            momentum_strength = "fort" if abs(data['change_24h']) > 3 else "modéré"
-            
-            # Analyse flux
-            flow_analysis = "ACCUMULATION" if data['net_flow'] > 0 else "DISTRIBUTION"
-            flow_emoji = "🟢" if data['net_flow'] > 0 else "🔴"
-            
-            # Signal confluence
-            confluence_signals = []
-            if data['change_24h'] < -3 and data['price'] < data['support'] * 1.02:
-                confluence_signals.append("Support test")
-            if data['net_flow'] > 50:
-                confluence_signals.append("Accumulation forte")
-            if data['liquidations_long'] > data['liquidations_short'] * 2:
-                confluence_signals.append("Long squeeze")
-            
-            signal_confluence = " + ".join(confluence_signals) if confluence_signals else "Signaux neutres"
-            
-            # Rapport enrichi
-            report = f"""{emoji} **{name.upper()} TRADING ANALYSIS**
+            report = f"""🚀 **CRYPTO TRADING ANALYSIS - 3 ASSETS**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-💰 **PRIX & PERFORMANCE**
-• Prix: ${data['price']:,.2f}
-• 24h: {data['change_24h']:+.2f}%
-• Volume 24h: ${data['volume_24h']/1_000_000_000:.1f}B
-• Market Cap: ${data['market_cap']/1_000_000_000:.0f}B
+🟠 **BITCOIN**
+• Prix: ${btc_data['price']:,.0f} | 24h: {btc_data['change_24h']:+.1f}%
+• Volume: ${btc_data['volume_24h']/1_000_000_000:.1f}B | MC: ${btc_data['market_cap']/1_000_000_000:.0f}B
+• Liquidations: L:{btc_data['liquidations_long']:.0f}M | S:{btc_data['liquidations_short']:.0f}M
+• Flux net: {btc_data['net_flow']:+.0f}M {"🟢" if btc_data['net_flow'] > 0 else "🔴"} ({"ACCU" if btc_data['net_flow'] > 0 else "DIST"})
+• Support: ${btc_data['support']:,.0f} | Résistance: ${btc_data['resistance']:,.0f}
 
-💀 **LIQUIDATIONS 24H**
-• Longs liquidés: ${data['liquidations_long']:.0f}M
-• Shorts liquidés: ${data['liquidations_short']:.0f}M
-• Total liquidations: ${data['liquidations_total']:.0f}M
+🔷 **ETHEREUM**
+• Prix: ${eth_data['price']:,.0f} | 24h: {eth_data['change_24h']:+.1f}%
+• Volume: ${eth_data['volume_24h']/1_000_000_000:.1f}B | MC: ${eth_data['market_cap']/1_000_000_000:.0f}B
+• Liquidations: L:{eth_data['liquidations_long']:.0f}M | S:{eth_data['liquidations_short']:.0f}M
+• Flux net: {eth_data['net_flow']:+.0f}M {"🟢" if eth_data['net_flow'] > 0 else "🔴"} ({"ACCU" if eth_data['net_flow'] > 0 else "DIST"})
+• Support: ${eth_data['support']:,.0f} | Résistance: ${eth_data['resistance']:,.0f}
 
-📊 **ANALYSE TECHNIQUE**
-• Support: ${data['support']:,.0f}
-• Résistance: ${data['resistance']:,.0f}
-• MA50: ${data['ma50']:,.0f}
-• MA200: ${data['ma200']:,.0f}
+🟣 **SOLANA**
+• Prix: ${sol_data['price']:,.0f} | 24h: {sol_data['change_24h']:+.1f}%
+• Volume: ${sol_data['volume_24h']/1_000_000_000:.1f}B | MC: ${sol_data['market_cap']/1_000_000_000:.0f}B
+• Liquidations: L:{sol_data['liquidations_long']:.0f}M | S:{sol_data['liquidations_short']:.0f}M
+• Flux net: {sol_data['net_flow']:+.0f}M {"🟢" if sol_data['net_flow'] > 0 else "🔴"} ({"ACCU" if sol_data['net_flow'] > 0 else "DIST"})
+• Support: ${sol_data['support']:,.0f} | Résistance: ${sol_data['resistance']:,.0f}
 
-💎 **FLUX ON-CHAIN (24h)**
-• Entrées exchanges: {data['exchange_inflow']:+.0f}M {"🟢" if data['exchange_inflow'] < 0 else "🔴"}
-• Sorties exchanges: {data['exchange_outflow']:+.0f}M {"🔴" if data['exchange_outflow'] > 0 else "🟢"}
-• Flux net: {data['net_flow']:+.0f}M {flow_emoji} ({flow_analysis})
-
-🔗 **DONNÉES ON-CHAIN**
-• Adresses actives: {data['active_addresses']:,}
-• Transactions: {data['transactions_24h']:,}
-
-📈 **MOMENTUM**: {momentum_strength.capitalize()} {momentum} ({data['change_24h']:+.1f}%)
-🎯 **CONFLUENCE**: {signal_confluence}
+📈 **ANALYSE GÉNÉRALE CRYPTO:**
+• Sentiment marché: {"Haussier" if (btc_data['change_24h'] + eth_data['change_24h'] + sol_data['change_24h'])/3 > 0 else "Baissier"}
+• Total liquidations: ${btc_data['liquidations_total'] + eth_data['liquidations_total'] + sol_data['liquidations_total']:.0f}M
+• Dominance flux: {"Accumulation généralisée" if btc_data['net_flow'] > 0 and eth_data['net_flow'] > 0 else "Mixte"}
 
 ⏰ Généré: {datetime.now().strftime('%d/%m/%Y à %H:%M')} - V4.0"""
             
             return report
             
         except Exception as e:
-            logger.error(f"❌ Erreur rapport enrichi {symbol}: {e}")
-            return f"❌ Erreur rapport {name}: {str(e)[:100]}"
+            logger.error(f"❌ Erreur rapport crypto groupé: {e}")
+            return "❌ Erreur génération rapport crypto groupé"
     
-    async def generate_eurusd_report(self) -> str:
-        """Rapport EUR/USD enrichi"""
+    async def generate_traditional_grouped_report(self) -> str:
+        """Rapport marchés traditionnels groupé (2 en 1)"""
         try:
-            data = await self.data_provider.get_eurusd_data()
+            eurusd_data = await self.data_provider.get_eurusd_data()
+            gold_data = await self.data_provider.get_gold_data()
             
-            momentum = "haussier" if data['change_24h'] > 0 else "baissier"
-            
-            report = f"""💱 **EUR/USD TRADING ANALYSIS**
+            report = f"""🌍 **MARCHÉS TRADITIONNELS ANALYSIS**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-💰 **TAUX & PERFORMANCE**
-• Taux: {data['rate']:.5f}
-• 24h: {data['change_24h']:+.2f}%
-• High 24h: {data['high_24h']:.5f}
-• Low 24h: {data['low_24h']:.5f}
+💱 **EUR/USD**
+• Taux: {eurusd_data['rate']:.5f} | 24h: {eurusd_data['change_24h']:+.2f}%
+• High: {eurusd_data['high_24h']:.5f} | Low: {eurusd_data['low_24h']:.5f}
+• Range: {((eurusd_data['high_24h'] - eurusd_data['low_24h']) * 10000):.0f} pips
+• Support: {eurusd_data['rate'] * 0.995:.5f} | Résistance: {eurusd_data['rate'] * 1.008:.5f}
 
-📊 **NIVEAUX TECHNIQUES**
-• Support: {data['rate'] * 0.995:.5f}
-• Résistance: {data['rate'] * 1.008:.5f}
-• Range 24h: {((data['high_24h'] - data['low_24h']) * 10000):.0f} pips
+🥇 **GOLD**
+• Prix: ${gold_data['price']:,.2f} | 24h: {gold_data['change_24h']:+.2f}%
+• High: ${gold_data['high_24h']:,.2f} | Low: ${gold_data['low_24h']:,.2f}
+• Range: ${gold_data['high_24h'] - gold_data['low_24h']:,.0f}
+• Support: ${gold_data['price'] * 0.985:,.0f} | Résistance: ${gold_data['price'] * 1.012:,.0f}
 
-💡 **ANALYSE**: EUR strength vs USD
-📈 **MOMENTUM**: {momentum.capitalize()} confirmé ({data['change_24h']:+.2f}%)
+📊 **FACTEURS MACRO:**
+• 🇪🇺 BCE: Moins hawkish que prévu
+• 🇺🇸 FED: Pause probable dans hausses taux
+• 💰 USD: Stabilisation en cours
+• 🏛️ Obligations: Rendements en baisse
+• 🌍 Géopolitique: Tensions modérées
 
-🇪🇺 **FACTEURS EUR:**
-• BCE moins hawkish que prévu
-• Données économiques européennes solides
-
-🇺🇸 **FACTEURS USD:**
-• FED pause probable
-• Données emploi US mitigées
-
-💎 **NIVEAUX CLÉS:**
-• Support majeur: {data['rate'] * 0.985:.5f}
-• Résistance critique: {data['rate'] * 1.015:.5f}
+💎 **NIVEAUX CLÉS SEMAINE:**
+• EUR/USD: Support majeur {eurusd_data['rate'] * 0.985:.5f} | Résistance {eurusd_data['rate'] * 1.015:.5f}
+• Gold: Support majeur $3,250 | Résistance critique $3,420
 
 ⏰ Généré: {datetime.now().strftime('%d/%m/%Y à %H:%M')} - V4.0"""
             
             return report
             
         except Exception as e:
-            logger.error(f"❌ Erreur rapport EUR/USD: {e}")
-            return "❌ Erreur rapport EUR/USD"
-    
-    async def generate_gold_report(self) -> str:
-        """Rapport Gold enrichi"""
-        try:
-            data = await self.data_provider.get_gold_data()
-            
-            momentum = "haussier" if data['change_24h'] > 0 else "baissier"
-            momentum_strength = "fort" if abs(data['change_24h']) > 1 else "modéré"
-            
-            report = f"""🥇 **GOLD TRADING ANALYSIS**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💰 **PRIX & PERFORMANCE**
-• Prix: ${data['price']:,.2f}
-• 24h: {data['change_24h']:+.2f}%
-• High 24h: ${data['high_24h']:,.2f}
-• Low 24h: ${data['low_24h']:,.2f}
-
-📊 **ANALYSE TECHNIQUE**
-• Support: ${data['price'] * 0.985:,.0f}
-• Résistance: ${data['price'] * 1.012:,.0f}
-• Range 24h: ${data['high_24h'] - data['low_24h']:,.0f}
-
-💡 **ANALYSE**: Strong bullish momentum
-
-📈 **MOMENTUM**: {momentum_strength.capitalize()} {momentum} ({data['change_24h']:+.2f}%)
-
-🌍 **FACTEURS FONDAMENTAUX:**
-• USD se stabilise
-• Rendements obligataires en baisse
-• Tensions géopolitiques modérées
-
-💎 **NIVEAUX CLÉS:**
-• Support majeur: $3,250
-• Résistance critique: $3,420
-• Objectif haussier: $3,480
-
-⏰ Généré: {datetime.now().strftime('%d/%m/%Y à %H:%M')} - V4.0"""
-            
-            return report
-            
-        except Exception as e:
-            logger.error(f"❌ Erreur rapport Gold: {e}")
-            return "❌ Erreur rapport Gold"
+            logger.error(f"❌ Erreur rapport traditionnels groupé: {e}")
+            return "❌ Erreur génération rapport marchés traditionnels"
     
     def generate_economic_calendar_summary(self) -> str:
         """Génère le résumé du calendrier économique"""
         events = self.economic_calendar.get_today_events()
         return self.economic_calendar.format_calendar_message(events)
 
-class TelegramPublisher:
-    """Publisher Telegram avec données enrichies"""
-    def __init__(self, token: str, chat_id: int, db_manager):
-        self.bot = Bot(token=token)
-        self.chat_id = chat_id
-        self.db = db_manager
-    
-    async def send_daily_reports_enriched(self):
-        """Envoie les rapports enrichis - AVEC GESTION WEEKEND"""
-        try:
-            report_gen = ReportGenerator(self.db)
-            now = datetime.now()
-            weekday = now.weekday()  # 0=Lundi, 6=Dimanche
-            
-            # Message d'introduction avec calendrier économique
-            calendar_summary = report_gen.generate_economic_calendar_summary()
-            
-            # ADAPTATION MESSAGE SELON LE JOUR
-            if not report_gen.is_forex_market_open():  # Weekend
-                intro_msg = f"""
-🚀 **BOT CRYPTO V4.0 - RAPPORT WEEKEND** 🚀
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-✅ **VERSION PRODUCTION ACTIVÉE**
-⏰ {datetime.now().strftime('%d/%m/%Y à %H:%M')}
-
-{calendar_summary}
-
-🎯 **RAPPORTS WEEKEND:**
-• 🟠 Bitcoin - Liquidations + Flux On-chain + Support/Résistance
-• 🔷 Ethereum - Liquidations + Flux On-chain + Support/Résistance  
-• 🟣 Solana - Liquidations + Flux On-chain + Support/Résistance
-• ⏸️ EUR/USD - MARCHÉ FERMÉ (Weekend)
-• ⏸️ Gold - MARCHÉ FERMÉ (Weekend)
-
-🔥 **ENVOI DES 3 RAPPORTS CRYPTO DANS 5 SECONDES...**
-                """
-            else:  # Semaine
-                intro_msg = f"""
-🚀 **BOT CRYPTO V4.0 FINAL - DONNÉES ENRICHIES** 🚀
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-✅ **VERSION PRODUCTION ACTIVÉE**
-⏰ {datetime.now().strftime('%d/%m/%Y à %H:%M')}
-
-{calendar_summary}
-
-🎯 **RAPPORTS ENRICHIS AUJOURD'HUI:**
-• 🟠 Bitcoin - Liquidations + Flux On-chain + Support/Résistance
-• 🔷 Ethereum - Liquidations + Flux On-chain + Support/Résistance  
-• 🟣 Solana - Liquidations + Flux On-chain + Support/Résistance
-• 💱 EUR/USD - Niveaux techniques + Facteurs macro
-• 🥇 Gold - Facteurs techniques/fondamentaux
-
-🔥 **ENVOI DES 5 RAPPORTS ENRICHIS DANS 5 SECONDES...**
-                """
-            
-            await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=intro_msg.strip(),
-                parse_mode='Markdown'
-            )
-            
-            await asyncio.sleep(5)
-            
-            # ASSETS SELON LE JOUR
-            if report_gen.is_forex_market_open():
-                # SEMAINE: 5 rapports
-                assets = [
-                    ('bitcoin', 'Bitcoin', '🟠'),
-                    ('ethereum', 'Ethereum', '🔷'),
-                    ('solana', 'Solana', '🟣'),
-                    ('EURUSD', 'EUR/USD', '💱'),
-                    ('GOLD', 'Gold', '🥇')
-                ]
-            else:
-                # WEEKEND: 3 rapports crypto seulement
-                assets = [
-                    ('bitcoin', 'Bitcoin', '🟠'),
-                    ('ethereum', 'Ethereum', '🔷'),
-                    ('solana', 'Solana', '🟣')
-                ]
-            
-            reports = []
-            
-            for symbol, name, emoji in assets:
-                try:
-                    if symbol == 'EURUSD':
-                        report = await report_gen.generate_eurusd_report()
-                    elif symbol == 'GOLD':
-                        report = await report_gen.generate_gold_report()
-                    else:
-                        report = await report_gen.generate_crypto_report_enriched(symbol, name, emoji)
-                    
-                    reports.append(report)
-                    
-                    await self.bot.send_message(
-                        chat_id=self.chat_id,
-                        text=report,
-                        parse_mode='Markdown'
-                    )
-                    await asyncio.sleep(6)  # Pause entre rapports
-                    logger.info(f"📊 Rapport enrichi {name} envoyé")
-                    
-                except Exception as e:
-                    logger.error(f"❌ Erreur rapport enrichi {name}: {e}")
-                    reports.append(f"❌ Erreur {name}")
-            
-            # Message de résumé final ADAPTÉ
-            if report_gen.is_forex_market_open():
-                summary = f"""
-📊 **RÉSUMÉ QUOTIDIEN V4.0 - {datetime.now().strftime('%d/%m/%Y')}**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-✅ **5 RAPPORTS ENRICHIS ENVOYÉS**
-• 🟠 Bitcoin avec liquidations + flux on-chain + confluence
-• 🔷 Ethereum avec liquidations + flux on-chain + confluence
-• 🟣 Solana avec liquidations + flux on-chain + confluence
-• 💱 EUR/USD avec niveaux techniques
-• 🥇 Gold avec analyse technique/fondamentale
-
-📈 **Prochains rapports: 8h00 demain**
-                """
-            else:
-                summary = f"""
-📊 **RÉSUMÉ WEEKEND V4.0 - {datetime.now().strftime('%d/%m/%Y')}**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-✅ **3 RAPPORTS CRYPTO ENVOYÉS** (Marchés Forex fermés)
-• 🟠 Bitcoin avec liquidations + flux on-chain + confluence
-• 🔷 Ethereum avec liquidations + flux on-chain + confluence
-• 🟣 Solana avec liquidations + flux on-chain + confluence
-
-⏸️ **MARCHÉS FERMÉS WEEKEND:**
-• 💱 EUR/USD - Reprend lundi 22h00 (ouverture Sydney)
-• 🥇 Gold - Reprend lundi 00h00 (ouverture Asie)
-
-📈 **Prochains rapports complets: 8h00 lundi**
-                """
-            
-            await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=summary.strip(),
-                parse_mode='Markdown'
-            )
-            
-            logger.info(f"📊 Rapports envoyés avec succès ({len(assets)} assets)")
-            
-        except Exception as e:
-            logger.error(f"❌ Erreur envoi rapports enrichis: {e}")
-
 class NewsTranslator:
-    """Traducteur news simplifié"""
+    """Traducteur news avec TRUMP et ÉCO prioritaires"""
     def __init__(self, db_manager):
         self.db = db_manager
         self.translator = GoogleTranslator(source='auto', target='fr')
@@ -696,17 +468,79 @@ class NewsTranslator:
             logger.warning(f"⚠️ Traduction échouée: {e}")
             return text
     
-    def is_important_crypto_news(self, title: str, content: str) -> bool:
+    def is_trump_event(self, title: str, content: str) -> bool:
+        """Détection Trump - PRIORITÉ ABSOLUE"""
         text = f"{title} {content}".lower()
-        keywords = ['bitcoin', 'ethereum', 'solana', 'fed', 'sec', 'etf', 'trump']
+        trump_keywords = ['trump speaks', 'trump live', 'trump press conference', 'president trump', 'donald trump', 'trump statement', 'trump announces']
+        urgency_keywords = ['breaking', 'live', 'now', 'urgent', 'just in']
+        
+        trump_mentions = any(keyword in text for keyword in trump_keywords)
+        is_urgent = any(keyword in text for keyword in urgency_keywords)
+        
+        return trump_mentions and is_urgent
+    
+    def is_economic_event(self, title: str, content: str) -> bool:
+        """Détection événements économiques - PRIORITÉ ÉLEVÉE"""
+        text = f"{title} {content}".lower()
+        eco_keywords = [
+            'fed decision', 'fomc', 'powell', 'interest rate', 'inflation data', 'cpi', 'ppi', 'nfp', 'employment',
+            'bce decision', 'lagarde', 'ecb', 'rate cut', 'rate hike', 'monetary policy',
+            'gdp', 'unemployment', 'retail sales', 'consumer confidence'
+        ]
+        
+        return any(keyword in text for keyword in eco_keywords)
+    
+    def is_important_crypto_news(self, title: str, content: str) -> bool:
+        """Détection crypto importantes"""
+        text = f"{title} {content}".lower()
+        keywords = ['bitcoin', 'ethereum', 'solana', 'sec', 'etf', 'regulation', 'hack', 'adoption']
         return any(keyword in text for keyword in keywords)
     
+    def create_trump_alert(self, title: str) -> str:
+        """Alerte Trump spectaculaire - ENVOI IMMÉDIAT"""
+        title_fr = self._safe_translate(title)
+        
+        return f"""
+🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
+🔴🔴🔴 TRUMP PARLE MAINTENANT 🔴🔴🔴
+🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
+
+🎤 **{title_fr}**
+⏰ **{datetime.now().strftime('%H:%M')} PARIS**
+
+🔥 **IMPACT ATTENDU:**
+• 🟠 Bitcoin & Cryptos
+• 💵 USD/EUR 
+• 📊 Marchés US
+
+🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
+        """
+    
+    def create_economic_alert(self, title: str, content: str) -> str:
+        """Alerte événement économique"""
+        title_fr = self._safe_translate(title)
+        content_fr = self._safe_translate(content[:200])
+        
+        return f"""
+🔔 **ÉVÉNEMENT ÉCONOMIQUE MAJEUR** 🔔
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📈 **{title_fr}**
+
+📊 **Détails:**
+{content_fr}
+
+💰 **Impact attendu:**
+• EUR/USD volatilité
+• Bitcoin réaction possible
+• Marchés traditionnels
+
+⏰ {datetime.now().strftime('%H:%M')} Paris
+        """
+    
     async def translate_and_store_news(self, title_en: str, content_en: str, url: str):
-        """Traduction et stockage simplifié"""
+        """Traduction et stockage avec PRIORITÉS"""
         try:
-            if not self.is_important_crypto_news(title_en, content_en):
-                return
-            
             content_hash = hashlib.md5(f"{title_en}{content_en}".encode()).hexdigest()
             
             conn = sqlite3.connect(self.db.db_path)
@@ -716,40 +550,313 @@ class NewsTranslator:
                 conn.close()
                 return
             
-            title_fr = self._safe_translate(title_en)
-            content_fr = self._safe_translate(content_en[:400])
+            # 1. TRUMP PRIORITAIRE - ENVOI IMMÉDIAT
+            if self.is_trump_event(title_en, content_en):
+                trump_alert = self.create_trump_alert(title_en)
+                cursor.execute('''
+                    INSERT INTO news_translated (title_fr, content_fr, importance, url, content_hash)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (trump_alert, "Trump Alert", 'TRUMP_ALERT', url, content_hash))
+                conn.commit()
+                conn.close()
+                logger.info("🚨 Alerte Trump créée")
+                return
             
-            cursor.execute('''
-                INSERT INTO news_translated (title_fr, content_fr, importance, url, content_hash)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (title_fr, content_fr, 'MEDIUM', url, content_hash))
-            conn.commit()
-            conn.close()
-            logger.info(f"📰 News traduite: {title_fr[:50]}...")
+            # 2. ÉVÉNEMENTS ÉCONOMIQUES - ENVOI RAPIDE
+            if self.is_economic_event(title_en, content_en):
+                eco_alert = self.create_economic_alert(title_en, content_en)
+                cursor.execute('''
+                    INSERT INTO news_translated (title_fr, content_fr, importance, url, content_hash)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (eco_alert, "Economic Event", 'ECO_ALERT', url, content_hash))
+                conn.commit()
+                conn.close()
+                logger.info("📊 Alerte économique créée")
+                return
             
+            # 3. NEWS CRYPTO NORMALES - GROUPÉES
+            if self.is_important_crypto_news(title_en, content_en):
+                title_fr = self._safe_translate(title_en)
+                content_fr = self._safe_translate(content_en[:400])
+                
+                cursor.execute('''
+                    INSERT INTO news_translated (title_fr, content_fr, importance, url, content_hash)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (title_fr, content_fr, 'MEDIUM', url, content_hash))
+                conn.commit()
+                conn.close()
+                logger.info(f"📰 News crypto traduite: {title_fr[:50]}...")
+            else:
+                conn.close()
+                
         except Exception as e:
             logger.error(f"❌ Erreur traduction: {e}")
 
+class TelegramPublisher:
+    """Publisher Telegram avec messages GROUPÉS et ALERTS prioritaires"""
+    def __init__(self, token: str, chat_id: int, db_manager):
+        self.bot = Bot(token=token)
+        self.chat_id = chat_id
+        self.db = db_manager
+    
+    async def send_daily_reports_grouped(self):
+        """Rapports groupés (7 messages → 3 messages)"""
+        try:
+            report_gen = ReportGenerator(self.db)
+            
+            calendar_summary = report_gen.generate_economic_calendar_summary()
+            
+            if not report_gen.is_forex_market_open():  # Weekend
+                intro_msg = f"""
+🚀 **BOT CRYPTO V4.0 - RAPPORT WEEKEND GROUPÉ** 🚀
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ **VERSION PRODUCTION OPTIMISÉE**
+⏰ {datetime.now().strftime('%d/%m/%Y à %H:%M')}
+
+{calendar_summary}
+
+🎯 **RAPPORT GROUPÉ WEEKEND:**
+• 🟠🔷🟣 3 Cryptos groupés dans 1 message
+• ⏸️ EUR/USD + Gold fermés (weekend)
+
+🔥 **ENVOI RAPPORT CRYPTO GROUPÉ DANS 3 SECONDES...**
+                """
+            else:  # Semaine
+                intro_msg = f"""
+🚀 **BOT CRYPTO V4.0 - RAPPORTS GROUPÉS OPTIMISÉS** 🚀
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ **VERSION PRODUCTION OPTIMISÉE**
+⏰ {datetime.now().strftime('%d/%m/%Y à %H:%M')}
+
+{calendar_summary}
+
+🎯 **RAPPORTS GROUPÉS AUJOURD'HUI:**
+• 🟠🔷🟣 3 Cryptos groupés dans 1 message
+• 💱🥇 EUR/USD + Gold groupés dans 1 message
+
+🔥 **ENVOI 2 RAPPORTS GROUPÉS DANS 3 SECONDES...**
+                """
+            
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=intro_msg.strip(),
+                parse_mode='Markdown'
+            )
+            
+            await asyncio.sleep(3)
+            
+            crypto_report = await report_gen.generate_crypto_grouped_report()
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=crypto_report,
+                parse_mode='Markdown'
+            )
+            logger.info("📊 Rapport crypto groupé envoyé")
+            
+            await asyncio.sleep(5)
+            
+            if report_gen.is_forex_market_open():
+                traditional_report = await report_gen.generate_traditional_grouped_report()
+                await self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=traditional_report,
+                    parse_mode='Markdown'
+                )
+                logger.info("📊 Rapport marchés traditionnels groupé envoyé")
+                
+                await asyncio.sleep(3)
+                
+                summary = f"""
+📊 **RÉSUMÉ QUOTIDIEN GROUPÉ - {datetime.now().strftime('%d/%m/%Y')}**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ **2 RAPPORTS GROUPÉS ENVOYÉS**
+• 🟠🔷🟣 Bitcoin + Ethereum + Solana (liquidations + flux + support/résistance)
+• 💱🥇 EUR/USD + Gold (niveaux techniques + facteurs macro)
+
+🎯 **OPTIMISATION:**
+• 60% moins de messages Telegram
+• Évite les rate limits
+• Lecture plus rapide et claire
+
+🚨 **ALERTES ACTIVES:**
+• Trump: Immédiate si intervention
+• Événements éco: Rapide si annonces
+
+📈 **Prochains rapports groupés: 8h00 demain**
+                """
+            else:
+                summary = f"""
+📊 **RÉSUMÉ WEEKEND GROUPÉ - {datetime.now().strftime('%d/%m/%Y')}**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ **1 RAPPORT CRYPTO GROUPÉ ENVOYÉ** (Marchés Forex fermés)
+• 🟠🔷🟣 Bitcoin + Ethereum + Solana (liquidations + flux + support/résistance)
+
+⏸️ **MARCHÉS FERMÉS WEEKEND:**
+• 💱 EUR/USD - Reprend lundi 22h00
+• 🥇 Gold - Reprend lundi 00h00
+
+🚨 **ALERTES ACTIVES WEEKEND:**
+• Trump: Surveillance continue
+• Éco: Pas d'événements majeurs
+
+📈 **Prochains rapports complets: 8h00 lundi**
+                """
+            
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=summary.strip(),
+                parse_mode='Markdown'
+            )
+            
+            logger.info("📊 Rapports groupés envoyés avec succès")
+            
+        except Exception as e:
+            logger.error(f"❌ Erreur envoi rapports groupés: {e}")
+    
+    async def send_priority_news(self):
+        """Envoi IMMÉDIAT des news prioritaires (Trump + Éco)"""
+        global last_trump_alert
+        
+        try:
+            conn = sqlite3.connect(self.db.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT id, title_fr, content_fr, url, importance
+                FROM news_translated 
+                WHERE is_sent = FALSE 
+                AND importance IN ('TRUMP_ALERT', 'ECO_ALERT')
+                ORDER BY 
+                    CASE importance 
+                        WHEN 'TRUMP_ALERT' THEN 0
+                        WHEN 'ECO_ALERT' THEN 1
+                    END,
+                    timestamp DESC 
+                LIMIT 3
+            ''')
+            
+            priority_news = cursor.fetchall()
+            
+            for news_id, title_fr, content_fr, url, importance in priority_news:
+                try:
+                    if importance == 'TRUMP_ALERT':
+                        if last_trump_alert:
+                            time_diff = (datetime.now() - last_trump_alert).total_seconds()
+                            if time_diff < 3600:
+                                continue
+                        
+                        await self.bot.send_message(
+                            chat_id=self.chat_id,
+                            text=title_fr,
+                            parse_mode='Markdown'
+                        )
+                        
+                        last_trump_alert = datetime.now()
+                        logger.info("🚨 ALERTE TRUMP ENVOYÉE")
+                        
+                    elif importance == 'ECO_ALERT':
+                        await self.bot.send_message(
+                            chat_id=self.chat_id,
+                            text=title_fr,
+                            parse_mode='Markdown'
+                        )
+                        logger.info("📊 ALERTE ÉCONOMIQUE ENVOYÉE")
+                    
+                    cursor.execute('UPDATE news_translated SET is_sent = TRUE WHERE id = ?', (news_id,))
+                    await asyncio.sleep(2)
+                    
+                except Exception as e:
+                    logger.error(f"❌ Erreur envoi news prioritaire {news_id}: {e}")
+                    continue
+            
+            conn.commit()
+            conn.close()
+            
+            if priority_news:
+                logger.info(f"🚨 {len(priority_news)} alertes prioritaires envoyées")
+            
+        except Exception as e:
+            logger.error(f"❌ Erreur envoi news prioritaires: {e}")
+    
+    async def send_news_grouped(self):
+        """News normales groupées"""
+        try:
+            conn = sqlite3.connect(self.db.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT id, title_fr, content_fr, url
+                FROM news_translated 
+                WHERE is_sent = FALSE 
+                AND importance = 'MEDIUM'
+                ORDER BY timestamp DESC 
+                LIMIT 3
+            ''')
+            
+            news_items = cursor.fetchall()
+            
+            if not news_items:
+                conn.close()
+                return
+            
+            message_parts = [
+                "📰 **CRYPTO NEWS DIGEST**",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            ]
+            
+            for i, (news_id, title_fr, content_fr, url) in enumerate(news_items, 1):
+                message_parts.append(f"""
+🔥 **NEWS {i}:** {title_fr[:60]}{'...' if len(title_fr) > 60 else ''}
+📝 {content_fr[:120]}{'...' if len(content_fr) > 120 else ''}""")
+                
+                cursor.execute('UPDATE news_translated SET is_sent = TRUE WHERE id = ?', (news_id,))
+            
+            message_parts.append(f"\n⏰ Compilé: {datetime.now().strftime('%H:%M')} - {len(news_items)} news")
+            
+            final_message = "\n".join(message_parts)
+            
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=final_message,
+                parse_mode='Markdown'
+            )
+            
+            conn.commit()
+            conn.close()
+            
+            logger.info(f"📰 {len(news_items)} news groupées envoyées")
+            
+        except Exception as e:
+            logger.error(f"❌ Erreur envoi news groupées: {e}")
+
 class FinalCryptoBotV4:
-    """Bot Crypto V4.0 FINAL - Version Simplifiée et Stable"""
+    """Bot Crypto V4.0 FINAL - Version GROUPÉE avec TRUMP et ÉCO"""
     def __init__(self):
         self.db = DatabaseManager()
         self.translator = NewsTranslator(self.db)
         self.publisher = TelegramPublisher(TOKEN, CHAT_ID, self.db)
     
     async def fetch_and_translate_news(self):
-        """Récupération news simplifiée"""
+        """Récupération news avec priorités"""
         try:
             sources = [
                 'https://www.coindesk.com/arc/outboundfeeds/rss/',
-                'https://cointelegraph.com/rss'
+                'https://cointelegraph.com/rss',
+                'https://feeds.reuters.com/reuters/topNews',
+                'https://rss.cnn.com/rss/edition.rss'
             ]
             
             for source_url in sources:
                 try:
                     feed = feedparser.parse(source_url)
                     
-                    for entry in feed.entries[:1]:  # Seulement 1 par source
+                    limit = 3 if 'reuters' in source_url or 'cnn' in source_url else 1
+                    
+                    for entry in feed.entries[:limit]:
                         title = entry.get('title', '')
                         content = entry.get('summary', entry.get('description', ''))
                         url = entry.get('link', '')
@@ -766,100 +873,48 @@ class FinalCryptoBotV4:
         except Exception as e:
             logger.error(f"❌ Erreur news: {e}")
     
-    async def send_news(self):
-        """Envoi news simplifié"""
+    async def news_cycle_complete(self):
+        """Cycle news COMPLET avec priorités"""
         try:
-            conn = sqlite3.connect(self.db.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                SELECT id, title_fr, content_fr, url
-                FROM news_translated 
-                WHERE is_sent = FALSE 
-                ORDER BY timestamp DESC 
-                LIMIT 2
-            ''')
-            
-            news_items = cursor.fetchall()
-            
-            for news_id, title_fr, content_fr, url in news_items:
-                try:
-                    message = f"""
-📰 **CRYPTO NEWS**
-━━━━━━━━━━━━━━━━━━━━━━
-
-**{title_fr}**
-
-{content_fr}
-
-⏰ {datetime.now().strftime('%H:%M')}
-                    """
-                    
-                    await self.publisher.bot.send_message(
-                        chat_id=CHAT_ID,
-                        text=message.strip(),
-                        parse_mode='Markdown'
-                    )
-                    
-                    cursor.execute('UPDATE news_translated SET is_sent = TRUE WHERE id = ?', (news_id,))
-                    await asyncio.sleep(3)
-                    
-                except Exception as e:
-                    logger.error(f"❌ Erreur envoi news {news_id}: {e}")
-                    continue
-            
-            conn.commit()
-            conn.close()
-            
-            if news_items:
-                logger.info(f"📰 {len(news_items)} news envoyées")
-            
+            await self.fetch_and_translate_news()
+            await self.publisher.send_priority_news()
+            await self.publisher.send_news_grouped()
         except Exception as e:
-            logger.error(f"❌ Erreur envoi news: {e}")
-    
-    async def news_cycle(self):
-        """Cycle news"""
-        await self.fetch_and_translate_news()
-        await self.send_news()
+            logger.error(f"❌ Erreur cycle news complet: {e}")
 
 # ===== FONCTIONS PRINCIPALES =====
 
 def envoyer_rapport_du_jour():
-    """Envoie le rapport quotidien - VERSION SIMPLE"""
+    """Envoie le rapport quotidien GROUPÉ"""
     global dernier_rapport_envoye, bot_instance
     
     try:
-        print(f"🕐 Déclenchement rapport 8h00 - {datetime.now().strftime('%H:%M')}")
+        print(f"🕐 Déclenchement rapport groupé 8h00 - {datetime.now().strftime('%H:%M')}")
         
-        # Anti-doublon
         aujourd_hui = datetime.now().date()
         if dernier_rapport_envoye == aujourd_hui:
             print("✅ Rapport déjà envoyé aujourd'hui")
             return
         
-        # Crée le bot si nécessaire
         if not bot_instance:
             bot_instance = FinalCryptoBotV4()
         
-        # Envoie le rapport
-        asyncio.run(bot_instance.publisher.send_daily_reports_enriched())
+        asyncio.run(bot_instance.publisher.send_daily_reports_grouped())
         
-        # Marque comme envoyé
         dernier_rapport_envoye = aujourd_hui
         
-        print("✅ Rapport 8h00 envoyé avec succès")
+        print("✅ Rapport groupé 8h00 envoyé avec succès")
         
     except Exception as e:
-        print(f"❌ Erreur rapport principal: {e}")
+        print(f"❌ Erreur rapport groupé: {e}")
         try:
-            # Notification d'erreur
             bot = Bot(token=TOKEN)
             asyncio.run(bot.send_message(
                 chat_id=CHAT_ID, 
-                text=f"🚨 Erreur rapport {datetime.now().strftime('%H:%M')}: {str(e)[:100]}"
+                text=f"🚨 Erreur rapport groupé {datetime.now().strftime('%H:%M')}"
             ))
         except:
-            print("❌ Impossible d'envoyer notification d'erreur")
+            print("❌ Notification erreur échouée")
 
 def envoyer_rapport_secours():
     """Rapport de secours 8h15"""
@@ -870,7 +925,6 @@ def envoyer_rapport_secours():
         
         aujourd_hui = datetime.now().date()
         
-        # Si pas de rapport aujourd'hui, envoie le secours
         if dernier_rapport_envoye != aujourd_hui:
             print("🔄 Envoi rapport de secours")
             envoyer_rapport_du_jour()
@@ -880,18 +934,32 @@ def envoyer_rapport_secours():
     except Exception as e:
         print(f"❌ Erreur rapport secours: {e}")
 
-def envoyer_news():
-    """Envoi news périodique"""
+def envoyer_news_prioritaires():
+    """Envoi news avec priorités TRUMP + ÉCO"""
     global bot_instance
     
     try:
         if not bot_instance:
             bot_instance = FinalCryptoBotV4()
         
-        asyncio.run(bot_instance.news_cycle())
+        asyncio.run(bot_instance.news_cycle_complete())
         
     except Exception as e:
-        logger.error(f"❌ Erreur news cycle: {e}")
+        logger.error(f"❌ Erreur news prioritaires: {e}")
+
+def check_urgent_news():
+    """Vérification news urgentes toutes les 30 minutes"""
+    global bot_instance
+    
+    try:
+        if not bot_instance:
+            bot_instance = FinalCryptoBotV4()
+        
+        asyncio.run(bot_instance.fetch_and_translate_news())
+        asyncio.run(bot_instance.publisher.send_priority_news())
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur check news urgentes: {e}")
 
 def keep_render_alive():
     """Ping toutes les 10 minutes pour éviter la veille"""
@@ -909,12 +977,11 @@ def keep_render_alive():
         except Exception as e:
             print(f"⚠️ Keep-alive failed: {e}")
         
-        time.sleep(600)  # 10 minutes
+        time.sleep(600)
 
 def run_flask():
-    """Lance Flask en arrière-plan - VERSION SÉCURISÉE"""
+    """Lance Flask en arrière-plan"""
     try:
-        # Lance keep-alive en parallèle
         ping_thread = threading.Thread(target=keep_render_alive, daemon=True)
         ping_thread.start()
         
@@ -923,56 +990,51 @@ def run_flask():
     except Exception as e:
         logger.error(f"❌ Erreur Flask: {e}")
         time.sleep(10)
-        run_flask()  # Restart Flask
+        run_flask()
 
 def main():
-    """Point d'entrée FINAL pour Render - SIMPLE ET FIABLE"""
+    """Point d'entrée FINAL - VERSION GROUPÉE + TRUMP + ÉCO"""
     global bot_instance
     
     try:
-        # Force timezone France
         os.environ['TZ'] = 'Europe/Paris'
         
-        # Lance Flask keep-alive
         flask_thread = threading.Thread(target=run_flask, daemon=True)
         flask_thread.start()
         logger.info("✅ Flask keep-alive sécurisé démarré")
         
-        # PROGRAMMATION SIMPLE ET FIABLE
         schedule.clear()
         
-        # RAPPORTS TOUS LES JOURS à 8h00 (contenu adapté automatiquement)
         schedule.every().day.at("08:00").do(envoyer_rapport_du_jour)
-        
-        # SECOURS 8h15 (si 8h00 a foiré)
         schedule.every().day.at("08:15").do(envoyer_rapport_secours)
+        schedule.every(4).hours.do(envoyer_news_prioritaires)
+        schedule.every(30).minutes.do(check_urgent_news)
         
-        # NEWS toutes les 2 heures (économie d'heures)
-        schedule.every(2).hours.do(envoyer_news)
+        logger.info("📊 Programmation GROUPÉE + PRIORITÉS activée")
+        logger.info("🎯 Rapports: 3 messages max | Trump: Immédiat | Éco: Rapide")
         
-        logger.info("📊 Programmation rapports 8h00 activée (7j/7)")
-        logger.info("🎯 Weekend: 3 rapports crypto | Semaine: 5 rapports complets")
-        
-        # Message de démarrage
         try:
             startup_msg = f"""
-🚀 **BOT CRYPTO V4.0 FINAL DÉMARRÉ** 🚀
+🚀 **BOT CRYPTO V4.0 - GROUPÉ + TRUMP + ÉCO** 🚀
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-✅ **VERSION STABLE ACTIVÉE**
+✅ **VERSION FINALE OPTIMISÉE**
 ⏰ {datetime.now().strftime('%d/%m/%Y à %H:%M')}
 
 🎯 **FONCTIONNALITÉS:**
-• 📊 Rapports enrichis 8h00 (7j/7)
-• 💀 Liquidations temps réel
-• 💎 Flux on-chain
-• 📈 Support/Résistance
-• 📅 Weekend: Crypto seulement (EUR/USD + Gold fermés)
+• 📊 Rapports groupés (3 messages max)
+• 🚨 Trump: Alerte immédiate si intervention
+• 📈 Événements éco: Alertes rapides
+• 📰 News crypto: Groupées toutes les 4h
 • 🔄 Keep-alive anti-crash
-• 📰 News crypto importantes
 
-📈 **PROCHAINS RAPPORTS: 8h00 DEMAIN**
-🔥 **SYSTÈME ANTI-CRASH ACTIF**
+🚨 **ALERTES PRIORITAIRES ACTIVES:**
+• Trump speaks/press → Immédiat
+• Fed/BCE decisions → Rapide
+• CPI/NFP/FOMC → Rapide
+
+📈 **PROCHAINS RAPPORTS GROUPÉS: 8h00 DEMAIN**
+🔥 **SURVEILLANCE TRUMP 24/7 ACTIVE !**
             """
             
             bot = Bot(token=TOKEN)
@@ -981,16 +1043,14 @@ def main():
         except Exception as e:
             logger.error(f"❌ Erreur message démarrage: {e}")
         
-        # BOUCLE PRINCIPALE SIMPLE ET STABLE
         while True:
             try:
                 schedule.run_pending()
-                time.sleep(30)  # Check toutes les 30 secondes
+                time.sleep(30)
                 
-                # Heartbeat pour logs
                 now = datetime.now()
-                if now.minute % 10 == 0 and now.second < 30:
-                    print(f"💓 Bot vivant - {now.strftime('%H:%M')} - Prochain rapport: 8h00")
+                if now.minute % 15 == 0 and now.second < 30:
+                    print(f"💓 Bot groupé + alertes vivant - {now.strftime('%H:%M')}")
                 
             except Exception as e:
                 logger.error(f"❌ Erreur boucle: {e}")
@@ -1000,9 +1060,9 @@ def main():
     except KeyboardInterrupt:
         logger.info("🛑 Arrêt manuel")
     except Exception as e:
-        logger.error(f"❌ Erreur critique main(): {e}")
+        logger.error(f"❌ Erreur critique: {e}")
         time.sleep(30)
-        main()  # Restart automatique
+        main()
 
 if __name__ == "__main__":
     try:
