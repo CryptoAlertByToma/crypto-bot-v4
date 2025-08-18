@@ -56,30 +56,52 @@ class DatabaseManager:
     
     @contextmanager
     def get_connection(self):
-        """Gestion sécurisée des connexions SQLite"""
-        max_retries = 3
+        """Gestion sécurisée des connexions SQLite avec retry robuste"""
+        max_retries = 5  # Augmenté pour Render
         retry_count = 0
+        conn = None
         
         while retry_count < max_retries:
             try:
                 with db_lock:
-                    conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
+                    # Configuration optimisée pour Render
+                    conn = sqlite3.connect(self.db_path, timeout=60.0, check_same_thread=False, isolation_level='DEFERRED')
                     conn.execute("PRAGMA journal_mode=WAL")
-                    conn.execute("PRAGMA busy_timeout=30000")
+                    conn.execute("PRAGMA busy_timeout=60000")  # 60 secondes
                     conn.execute("PRAGMA synchronous=NORMAL")
+                    conn.execute("PRAGMA temp_store=MEMORY")
+                    conn.execute("PRAGMA cache_size=10000")
                     conn.row_factory = sqlite3.Row
+                    
                     yield conn
-                    conn.commit()
+                    
+                    if conn.in_transaction:
+                        conn.commit()
                     return
+                    
             except sqlite3.OperationalError as e:
                 retry_count += 1
+                logger.warning(f"Database locked, retry {retry_count}/{max_retries}")
                 if retry_count >= max_retries:
-                    logger.error(f"Database locked after {max_retries} retries")
+                    logger.error(f"Database locked after {max_retries} retries: {e}")
+                    # Crée une nouvelle connexion en dernier recours
+                    if conn:
+                        conn.rollback()
+                        conn.close()
+                    time.sleep(2)
                     raise
-                time.sleep(1)
+                time.sleep(retry_count * 0.5)  # Backoff progressif
+            except Exception as e:
+                logger.error(f"Database error: {e}")
+                if conn and conn.in_transaction:
+                    conn.rollback()
+                raise
             finally:
-                if 'conn' in locals():
-                    conn.close()
+                if conn:
+                    try:
+                        conn.close()
+                    except:
+                        pass
     
     def init_database(self):
         """Initialisation de la base de données"""
@@ -323,43 +345,60 @@ class NewsTranslator:
             logger.error(f"Erreur traitement news: {e}")
 
 class TelegramPublisher:
-    """Publie les messages sur Telegram avec gestion optimisée"""
+    """Publie les messages sur Telegram avec gestion ultra-robuste pour Render"""
     def __init__(self, token: str, chat_id: int, db_manager):
-        # Configuration du bot avec pool optimisé
+        # Configuration du bot avec pool très large pour Render
         request = HTTPXRequest(
-            connection_pool_size=20,
-            pool_timeout=30.0,
-            read_timeout=20.0,
-            write_timeout=20.0
+            connection_pool_size=40,  # Doublé pour Render
+            pool_timeout=60.0,  # Timeout très long
+            read_timeout=30.0,
+            write_timeout=30.0,
+            connect_timeout=30.0
         )
         self.bot = Bot(token=token, request=request)
         self.chat_id = chat_id
         self.db = db_manager
         self.last_message_time = 0
-        self.min_delay = 1.0  # Délai minimum entre messages
+        self.min_delay = 2.0  # Délai augmenté pour éviter rate limit
     
     async def send_message_safe(self, text: str, parse_mode: str = 'Markdown'):
-        """Envoie un message avec gestion du rate limiting"""
-        try:
-            # Rate limiting
-            current_time = time.time()
-            time_since_last = current_time - self.last_message_time
-            if time_since_last < self.min_delay:
-                await asyncio.sleep(self.min_delay - time_since_last)
-            
-            # Envoie le message
-            await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=text,
-                parse_mode=parse_mode
-            )
-            
-            self.last_message_time = time.time()
-            return True
-            
-        except Exception as e:
-            logger.error(f"Erreur envoi message: {e}")
-            return False
+        """Envoie un message avec retry et gestion d'erreur robuste pour Render"""
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                # Rate limiting strict
+                current_time = time.time()
+                time_since_last = current_time - self.last_message_time
+                if time_since_last < self.min_delay:
+                    await asyncio.sleep(self.min_delay - time_since_last)
+                
+                # Tentative d'envoi
+                await self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                    disable_web_page_preview=True
+                )
+                
+                self.last_message_time = time.time()
+                return True
+                
+            except Exception as e:
+                retry_count += 1
+                logger.warning(f"Erreur envoi message (tentative {retry_count}/{max_retries}): {e}")
+                
+                if "Pool timeout" in str(e) or "Connection pool" in str(e):
+                    await asyncio.sleep(5)  # Attente plus longue pour pool timeout
+                else:
+                    await asyncio.sleep(retry_count * 2)
+                
+                if retry_count >= max_retries:
+                    logger.error(f"Échec envoi après {max_retries} tentatives")
+                    return False
+        
+        return False
     
     async def send_daily_report(self):
         """Envoie le rapport quotidien"""
@@ -550,19 +589,31 @@ def run_news_cycle():
         logger.error(f"Erreur news: {e}")
 
 def keep_alive():
-    """Maintient le service actif sur Render"""
+    """Maintient le service actif sur Render avec ping intelligent"""
     render_url = os.environ.get('RENDER_EXTERNAL_URL')
     if render_url:
         if not render_url.startswith('http'):
             render_url = f"https://{render_url}"
         
+        consecutive_fails = 0
         while True:
             try:
-                requests.get(f"{render_url}/status", timeout=10)
-                logger.debug("Keep-alive ping")
-            except:
-                pass
-            time.sleep(300)  # Ping toutes les 5 minutes
+                response = requests.get(f"{render_url}/status", timeout=10)
+                if response.status_code == 200:
+                    consecutive_fails = 0
+                    logger.debug("Keep-alive OK")
+                else:
+                    consecutive_fails += 1
+                    logger.warning(f"Keep-alive status: {response.status_code}")
+            except Exception as e:
+                consecutive_fails += 1
+                logger.warning(f"Keep-alive failed ({consecutive_fails}): {e}")
+            
+            # Ajuste le délai selon les échecs
+            if consecutive_fails > 3:
+                time.sleep(600)  # 10 min si beaucoup d'échecs
+            else:
+                time.sleep(300)  # 5 min normal
 
 def run_flask():
     """Lance Flask"""
