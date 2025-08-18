@@ -367,20 +367,18 @@ class TelegramPublisher:
             report_gen = ReportGenerator()
             
             # Message d'intro
-            intro = f"""🚀 **BOT CRYPTO V4.0**
+            intro = f"""🚀 **BOT CRYPTO V4.0 - RAPPORT QUOTIDIEN**
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📊 **OPTIMISATIONS:**
-• 📈 Rapports groupés (3 messages max)
-• 🚨 Alertes prioritaires actives
-• 📰 News: Mode adaptatif
-• 💓 Système anti-erreur SQLite
-• 🔄 Pool Telegram optimisé
+⏰ {datetime.now().strftime('%d/%m/%Y à %H:%M')}
 
-🚨 **ALERTES PRIORITAIRES ACTIVES:**
-• Breaking news → Immédiat
-• Événements majeurs → Rapide
-• News crypto → Groupées"""
+📊 **FONCTIONNALITÉS ACTIVES:**
+• Rapports crypto 2x/jour (8h et 20h)
+• Alertes breaking news en temps réel
+• News crypto compilées toutes les 2h
+• Données EUR/USD et Gold en semaine
+
+🔥 Envoi des rapports dans 3 secondes..."""
             
             await self.send_message_safe(intro)
             await asyncio.sleep(2)
@@ -420,14 +418,14 @@ class TelegramPublisher:
                 if critical_news:
                     news_id, title, content, importance = critical_news
                     
-                    message = f"""🚨 **ALERTE IMPORTANTE** 🚨
+                    message = f"""🚨 **BREAKING NEWS** 🚨
 ━━━━━━━━━━━━━━━━━━━━━━━━━
 
 📰 {title}
 
-{content}
+📝 {content[:200]}...
 
-⏰ {datetime.now().strftime('%H:%M')}"""
+⏰ {datetime.now().strftime('%H:%M')} Paris"""
                     
                     if await self.send_message_safe(message):
                         cursor.execute('UPDATE news_translated SET is_sent = TRUE WHERE id = ?', (news_id,))
@@ -596,7 +594,16 @@ def main():
         
         # Message de démarrage
         bot_instance = CryptoBot()
-        asyncio.run(bot_instance.publisher.send_message_safe("✅ Bot Crypto V4.0 démarré"))
+        startup_msg = f"""✅ **BOT CRYPTO V4.0 - DÉMARRÉ**
+━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🟢 Système opérationnel
+📊 Rapports programmés: 8h00 et 20h00
+📰 Scan des news: toutes les 2h
+
+Prochain rapport dans {(8 - datetime.now().hour) % 12}h"""
+        
+        asyncio.run(bot_instance.publisher.send_message_safe(startup_msg))
         
         # Boucle principale
         while True:
