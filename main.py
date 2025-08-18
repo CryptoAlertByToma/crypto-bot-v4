@@ -11,11 +11,13 @@ import os
 import pytz
 from datetime import datetime, timedelta
 from telegram import Bot
+from telegram.request import HTTPXRequest  # IMPORTANT: Pour configurer le pool
 from typing import Dict, List, Optional
 import feedparser
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 from flask import Flask
+from contextlib import contextmanager
 
 # === CONFIGURATION RENDER - VARIABLES D'ENVIRONNEMENT ===
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8050724073:AAHugCqSuHUWPOJXJUFoH7TlEptW_jB-790')
@@ -54,77 +56,93 @@ def status():
 dernier_rapport_envoye = None
 bot_instance = None
 last_trump_alert = None
+db_lock = threading.Lock()  # IMPORTANT: Lock pour SQLite
 
 class DatabaseManager:
     def __init__(self, db_path="crypto_bot_v4_final.db"):
         self.db_path = db_path
         self.init_database()
     
+    @contextmanager
+    def get_connection(self):
+        """Context manager pour gérer les connexions SQLite avec lock"""
+        with db_lock:
+            conn = sqlite3.connect(self.db_path, timeout=30.0)  # Timeout augmenté
+            conn.execute("PRAGMA journal_mode=WAL")  # WAL mode pour meilleure concurrence
+            conn.execute("PRAGMA busy_timeout=30000")  # 30 secondes timeout
+            try:
+                yield conn
+            finally:
+                conn.close()
+    
     def init_database(self):
-        """Base de données production V4.0"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Table données enrichies
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS market_data (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                price REAL,
-                change_24h REAL,
-                volume_24h REAL,
-                market_cap REAL,
-                high_24h REAL,
-                low_24h REAL,
-                support REAL,
-                resistance REAL,
-                ma50 REAL,
-                ma200 REAL,
-                liquidations_long REAL,
-                liquidations_short REAL,
-                liquidations_total REAL,
-                exchange_inflow REAL,
-                exchange_outflow REAL,
-                net_flow REAL,
-                active_addresses INTEGER,
-                transactions_24h INTEGER,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Table news
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS news_translated (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title_fr TEXT,
-                content_fr TEXT,
-                importance TEXT,
-                url TEXT,
-                is_sent BOOLEAN DEFAULT FALSE,
-                content_hash TEXT UNIQUE,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Table rapports quotidiens
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS daily_reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                report_date DATE UNIQUE,
-                btc_report TEXT,
-                eth_report TEXT,
-                sol_report TEXT,
-                eurusd_report TEXT,
-                gold_report TEXT,
-                economic_calendar TEXT,
-                is_sent BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-        logger.info("✅ Base de données V4.0 enrichie initialisée")
+        """Base de données production V4.0 avec WAL mode"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Active WAL mode pour meilleure gestion concurrence
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            
+            # Table données enrichies
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS market_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    price REAL,
+                    change_24h REAL,
+                    volume_24h REAL,
+                    market_cap REAL,
+                    high_24h REAL,
+                    low_24h REAL,
+                    support REAL,
+                    resistance REAL,
+                    ma50 REAL,
+                    ma200 REAL,
+                    liquidations_long REAL,
+                    liquidations_short REAL,
+                    liquidations_total REAL,
+                    exchange_inflow REAL,
+                    exchange_outflow REAL,
+                    net_flow REAL,
+                    active_addresses INTEGER,
+                    transactions_24h INTEGER,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Table news
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS news_translated (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title_fr TEXT,
+                    content_fr TEXT,
+                    importance TEXT,
+                    url TEXT,
+                    is_sent BOOLEAN DEFAULT FALSE,
+                    content_hash TEXT UNIQUE,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Table rapports quotidiens
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS daily_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    report_date DATE UNIQUE,
+                    btc_report TEXT,
+                    eth_report TEXT,
+                    sol_report TEXT,
+                    eurusd_report TEXT,
+                    gold_report TEXT,
+                    economic_calendar TEXT,
+                    is_sent BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            conn.commit()
+            logger.info("✅ Base de données V4.0 WAL mode initialisée")
 
 class EconomicCalendar:
     """Calendrier économique automatique"""
@@ -539,65 +557,45 @@ class NewsTranslator:
         """
     
     async def translate_and_store_news(self, title_en: str, content_en: str, url: str):
-        """Traduction et stockage avec PRIORITÉS"""
+        """Traduction et stockage avec PRIORITÉS - Version thread-safe"""
         try:
             content_hash = hashlib.md5(f"{title_en}{content_en}".encode()).hexdigest()
             
-            conn = sqlite3.connect(self.db.db_path)
-            cursor = conn.cursor()
-            cursor.execute('SELECT id FROM news_translated WHERE content_hash = ?', (content_hash,))
-            if cursor.fetchone():
-                conn.close()
-                return
-            
-            # 1. TRUMP PRIORITAIRE - ENVOI IMMÉDIAT
-            if self.is_trump_event(title_en, content_en):
-                trump_alert = self.create_trump_alert(title_en)
-                cursor.execute('''
-                    INSERT INTO news_translated (title_fr, content_fr, importance, url, content_hash)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (trump_alert, "Trump Alert", 'TRUMP_ALERT', url, content_hash))
-                conn.commit()
-                conn.close()
-                logger.info("🚨 Alerte Trump créée")
-                return
-            
-            # 2. ÉVÉNEMENTS ÉCONOMIQUES - ENVOI RAPIDE
-            if self.is_economic_event(title_en, content_en):
-                eco_alert = self.create_economic_alert(title_en, content_en)
-                cursor.execute('''
-                    INSERT INTO news_translated (title_fr, content_fr, importance, url, content_hash)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (eco_alert, "Economic Event", 'ECO_ALERT', url, content_hash))
-                conn.commit()
-                conn.close()
-                logger.info("📊 Alerte économique créée")
-                return
-            
-            # 3. NEWS CRYPTO NORMALES - GROUPÉES
-            if self.is_important_crypto_news(title_en, content_en):
-                title_fr = self._safe_translate(title_en)
-                content_fr = self._safe_translate(content_en[:400])
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT id FROM news_translated WHERE content_hash = ?', (content_hash,))
+                if cursor.fetchone():
+                    return
                 
-                cursor.execute('''
-                    INSERT INTO news_translated (title_fr, content_fr, importance, url, content_hash)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (title_fr, content_fr, 'MEDIUM', url, content_hash))
-                conn.commit()
-                conn.close()
-                logger.info(f"📰 News crypto traduite: {title_fr[:50]}...")
-            else:
-                conn.close()
+                # 1. TRUMP PRIORITAIRE - ENVOI IMMÉDIAT
+                if self.is_trump_event(title_en, content_en):
+                    trump_alert = self.create_trump_alert(title_en)
+                    cursor.execute('''
+                        INSERT INTO news_translated (title_fr, content_fr, importance, url, content_hash)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (title_fr, content_fr, 'MEDIUM', url, content_hash))
+                    conn.commit()
+                    logger.info(f"📰 News crypto traduite: {title_fr[:50]}...")
                 
         except Exception as e:
             logger.error(f"❌ Erreur traduction: {e}")
 
 class TelegramPublisher:
-    """Publisher Telegram avec messages GROUPÉS et ALERTS prioritaires"""
+    """Publisher Telegram avec pool de connexions optimisé"""
     def __init__(self, token: str, chat_id: int, db_manager):
-        self.bot = Bot(token=token)
+        # Configuration du pool de connexions HTTPX
+        request = HTTPXRequest(
+            connection_pool_size=20,  # Augmentation du pool
+            pool_timeout=30.0,       # Timeout plus long
+            read_timeout=20.0,
+            write_timeout=20.0,
+            connect_timeout=20.0
+        )
+        self.bot = Bot(token=token, request=request)
         self.chat_id = chat_id
         self.db = db_manager
+        self.message_queue = asyncio.Queue()  # Queue pour gérer les messages
+        self.rate_limit_delay = 1  # Délai entre messages (secondes)
     
     async def send_daily_reports_grouped(self):
         """Rapports groupés (7 messages → 3 messages)"""
@@ -718,118 +716,118 @@ class TelegramPublisher:
             logger.error(f"❌ Erreur envoi rapports groupés: {e}")
     
     async def send_priority_news(self):
-        """Envoi IMMÉDIAT des news prioritaires (Trump + Éco)"""
+        """Envoi IMMÉDIAT des news prioritaires (Trump + Éco) - Version thread-safe"""
         global last_trump_alert
         
         try:
-            conn = sqlite3.connect(self.db.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                SELECT id, title_fr, content_fr, url, importance
-                FROM news_translated 
-                WHERE is_sent = FALSE 
-                AND importance IN ('TRUMP_ALERT', 'ECO_ALERT')
-                ORDER BY 
-                    CASE importance 
-                        WHEN 'TRUMP_ALERT' THEN 0
-                        WHEN 'ECO_ALERT' THEN 1
-                    END,
-                    timestamp DESC 
-                LIMIT 3
-            ''')
-            
-            priority_news = cursor.fetchall()
-            
-            for news_id, title_fr, content_fr, url, importance in priority_news:
-                try:
-                    if importance == 'TRUMP_ALERT':
-                        if last_trump_alert:
-                            time_diff = (datetime.now() - last_trump_alert).total_seconds()
-                            if time_diff < 3600:
-                                continue
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                    SELECT id, title_fr, content_fr, url, importance
+                    FROM news_translated 
+                    WHERE is_sent = FALSE 
+                    AND importance IN ('TRUMP_ALERT', 'ECO_ALERT')
+                    ORDER BY 
+                        CASE importance 
+                            WHEN 'TRUMP_ALERT' THEN 0
+                            WHEN 'ECO_ALERT' THEN 1
+                        END,
+                        timestamp DESC 
+                    LIMIT 3
+                ''')
+                
+                priority_news = cursor.fetchall()
+                
+                for news_id, title_fr, content_fr, url, importance in priority_news:
+                    try:
+                        if importance == 'TRUMP_ALERT':
+                            if last_trump_alert:
+                                time_diff = (datetime.now() - last_trump_alert).total_seconds()
+                                if time_diff < 3600:
+                                    continue
+                            
+                            await self.bot.send_message(
+                                chat_id=self.chat_id,
+                                text=title_fr,
+                                parse_mode='Markdown'
+                            )
+                            
+                            last_trump_alert = datetime.now()
+                            logger.info("🚨 ALERTE TRUMP ENVOYÉE")
+                            
+                        elif importance == 'ECO_ALERT':
+                            await self.bot.send_message(
+                                chat_id=self.chat_id,
+                                text=title_fr,
+                                parse_mode='Markdown'
+                            )
+                            logger.info("📊 ALERTE ÉCONOMIQUE ENVOYÉE")
                         
-                        await self.bot.send_message(
-                            chat_id=self.chat_id,
-                            text=title_fr,
-                            parse_mode='Markdown'
-                        )
+                        cursor.execute('UPDATE news_translated SET is_sent = TRUE WHERE id = ?', (news_id,))
+                        await asyncio.sleep(2)
                         
-                        last_trump_alert = datetime.now()
-                        logger.info("🚨 ALERTE TRUMP ENVOYÉE")
-                        
-                    elif importance == 'ECO_ALERT':
-                        await self.bot.send_message(
-                            chat_id=self.chat_id,
-                            text=title_fr,
-                            parse_mode='Markdown'
-                        )
-                        logger.info("📊 ALERTE ÉCONOMIQUE ENVOYÉE")
-                    
-                    cursor.execute('UPDATE news_translated SET is_sent = TRUE WHERE id = ?', (news_id,))
-                    await asyncio.sleep(2)
-                    
-                except Exception as e:
-                    logger.error(f"❌ Erreur envoi news prioritaire {news_id}: {e}")
-                    continue
-            
-            conn.commit()
-            conn.close()
-            
-            if priority_news:
-                logger.info(f"🚨 {len(priority_news)} alertes prioritaires envoyées")
+                    except Exception as e:
+                        logger.error(f"❌ Erreur envoi news prioritaire {news_id}: {e}")
+                        continue
+                
+                conn.commit()
+                
+                if priority_news:
+                    logger.info(f"🚨 {len(priority_news)} alertes prioritaires envoyées")
             
         except Exception as e:
             logger.error(f"❌ Erreur envoi news prioritaires: {e}")
     
     async def send_news_grouped(self):
-        """News normales groupées"""
+        """News normales groupées - Version thread-safe avec rate limiting"""
         try:
-            conn = sqlite3.connect(self.db.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                SELECT id, title_fr, content_fr, url
-                FROM news_translated 
-                WHERE is_sent = FALSE 
-                AND importance = 'MEDIUM'
-                ORDER BY timestamp DESC 
-                LIMIT 3
-            ''')
-            
-            news_items = cursor.fetchall()
-            
-            if not news_items:
-                conn.close()
-                return
-            
-            message_parts = [
-                "📰 **CRYPTO NEWS DIGEST**",
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            ]
-            
-            for i, (news_id, title_fr, content_fr, url) in enumerate(news_items, 1):
-                message_parts.append(f"""
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                    SELECT id, title_fr, content_fr, url
+                    FROM news_translated 
+                    WHERE is_sent = FALSE 
+                    AND importance = 'MEDIUM'
+                    ORDER BY timestamp DESC 
+                    LIMIT 3
+                ''')
+                
+                news_items = cursor.fetchall()
+                
+                if not news_items:
+                    return
+                
+                message_parts = [
+                    "📰 **CRYPTO NEWS DIGEST**",
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                ]
+                
+                for i, (news_id, title_fr, content_fr, url) in enumerate(news_items, 1):
+                    message_parts.append(f"""
 🔥 **NEWS {i}:** {title_fr[:60]}{'...' if len(title_fr) > 60 else ''}
 📝 {content_fr[:120]}{'...' if len(content_fr) > 120 else ''}""")
+                    
+                    cursor.execute('UPDATE news_translated SET is_sent = TRUE WHERE id = ?', (news_id,))
                 
-                cursor.execute('UPDATE news_translated SET is_sent = TRUE WHERE id = ?', (news_id,))
-            
-            message_parts.append(f"\n⏰ Compilé: {datetime.now().strftime('%H:%M')} - {len(news_items)} news")
-            
-            final_message = "\n".join(message_parts)
-            
-            await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=final_message,
-                parse_mode='Markdown'
-            )
-            
-            conn.commit()
-            conn.close()
-            
-            logger.info(f"📰 {len(news_items)} news groupées envoyées")
-            
+                message_parts.append(f"\n⏰ Compilé: {datetime.now().strftime('%H:%M')} - {len(news_items)} news")
+                
+                final_message = "\n".join(message_parts)
+                
+                # Rate limiting pour éviter le pool timeout
+                await asyncio.sleep(self.rate_limit_delay)
+                
+                await self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=final_message,
+                    parse_mode='Markdown'
+                )
+                
+                conn.commit()
+                
+                logger.info(f"📰 {len(news_items)} news groupées envoyées")
+                
         except Exception as e:
             logger.error(f"❌ Erreur envoi news groupées: {e}")
 
@@ -908,7 +906,8 @@ def envoyer_rapport_du_jour():
     except Exception as e:
         print(f"❌ Erreur rapport groupé: {e}")
         try:
-            bot = Bot(token=TOKEN)
+            request = HTTPXRequest(connection_pool_size=10, pool_timeout=30.0)
+            bot = Bot(token=TOKEN, request=request)
             asyncio.run(bot.send_message(
                 chat_id=CHAT_ID, 
                 text=f"🚨 Erreur rapport groupé {datetime.now().strftime('%H:%M')}"
@@ -1070,7 +1069,8 @@ def main():
 🔥 **SURVEILLANCE TRUMP 24/7 ACTIVE !**
             """
             
-            bot = Bot(token=TOKEN)
+            request = HTTPXRequest(connection_pool_size=10, pool_timeout=30.0)
+            bot = Bot(token=TOKEN, request=request)
             asyncio.run(bot.send_message(chat_id=CHAT_ID, text=startup_msg.strip(), parse_mode='Markdown'))
             
         except Exception as e:
@@ -1119,3 +1119,27 @@ if __name__ == "__main__":
         exit(1)
     
     main()
+                    ''', (trump_alert, "Trump Alert", 'TRUMP_ALERT', url, content_hash))
+                    conn.commit()
+                    logger.info("🚨 Alerte Trump créée")
+                    return
+                
+                # 2. ÉVÉNEMENTS ÉCONOMIQUES - ENVOI RAPIDE
+                if self.is_economic_event(title_en, content_en):
+                    eco_alert = self.create_economic_alert(title_en, content_en)
+                    cursor.execute('''
+                        INSERT INTO news_translated (title_fr, content_fr, importance, url, content_hash)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (eco_alert, "Economic Event", 'ECO_ALERT', url, content_hash))
+                    conn.commit()
+                    logger.info("📊 Alerte économique créée")
+                    return
+                
+                # 3. NEWS CRYPTO NORMALES - GROUPÉES
+                if self.is_important_crypto_news(title_en, content_en):
+                    title_fr = self._safe_translate(title_en)
+                    content_fr = self._safe_translate(content_en[:400])
+                    
+                    cursor.execute('''
+                        INSERT INTO news_translated (title_fr, content_fr, importance, url, content_hash)
+                        VALUES (?, ?, ?, ?, ?)
