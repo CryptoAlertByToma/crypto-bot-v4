@@ -1,765 +1,485 @@
+# bot_crypto_v4_fixed.py
 import asyncio
 import sqlite3
 import requests
 import hashlib
 import logging
-import json
-import schedule
+import os
 import time
 import threading
-import os
-import pytz
-from datetime import datetime, timedelta
-from telegram import Bot
-from telegram.request import HTTPXRequest
-from typing import Dict, List, Optional
+from datetime import datetime
+from typing import Dict
+from contextlib import contextmanager
+
 import feedparser
-from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 from flask import Flask
-from contextlib import contextmanager
-import queue
+from telegram import Bot
+from telegram.request import HTTPXRequest
 
-# === CONFIGURATION ===
+# ========= CONFIG =========
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8050724073:AAHugCqSuHUWPOJXJUFoH7TlEptW_jB-790')
 CHAT_ID = int(os.environ.get('CHAT_ID', '5926402259'))
-
-# APIs
 COINGLASS_API_KEY = os.environ.get('COINGLASS_API_KEY', 'f8ca50e46d2e460eb4465a754fb9a9bf')
 ALPHA_VANTAGE_KEY = os.environ.get('ALPHA_VANTAGE_KEY', '4J51YB27HHDW6X62')
 
-# Configuration logging
+# Logging
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[logging.StreamHandler()],
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("bot")
 
-# Flask pour Render
+# Flask (Render healthcheck)
 app = Flask(__name__)
+@app.get("/")
+def home(): return "Bot Crypto V4.1 actif"
+@app.get("/status")
+def status(): return {"status":"active","time":datetime.now().isoformat()}
 
-@app.route('/')
-def home():
-    return "Bot Crypto V4.0 Actif"
-
-@app.route('/status')
-def status():
-    return {"status": "active", "time": datetime.now().isoformat()}
-
-# Variables globales
-dernier_rapport_envoye = None
-bot_instance = None
+# Globals
 db_lock = threading.Lock()
+job_lock = threading.Lock()          # évite que deux jobs tournent en même temps
+send_lock = asyncio.Lock()           # sérialise tous les envois Telegram
+bot_instance = None
+last_report_date = None
 
+# ========= DB =========
 class DatabaseManager:
-    def __init__(self, db_path="crypto_bot.db"):
-        self.db_path = db_path
-        self.init_database()
-    
+    def __init__(self, path="crypto_bot.db"):
+        self.path = path
+        self.init()
+
     @contextmanager
-    def get_connection(self):
-        """Gestion sécurisée des connexions SQLite avec retry robuste"""
-        max_retries = 5
-        retry_count = 0
-        conn = None
-        
-        while retry_count < max_retries:
+    def conn(self):
+        max_retries, tries, c = 5, 0, None
+        while True:
             try:
                 with db_lock:
-                    conn = sqlite3.connect(self.db_path, timeout=60.0, check_same_thread=False, isolation_level='DEFERRED')
-                    conn.execute("PRAGMA journal_mode=WAL")
-                    conn.execute("PRAGMA busy_timeout=60000")
-                    conn.execute("PRAGMA synchronous=NORMAL")
-                    conn.execute("PRAGMA temp_store=MEMORY")
-                    conn.execute("PRAGMA cache_size=10000")
-                    conn.row_factory = sqlite3.Row
-                    
-                    yield conn
-                    
-                    if conn.in_transaction:
-                        conn.commit()
-                    return
-                    
+                    c = sqlite3.connect(self.path, timeout=60.0, check_same_thread=False, isolation_level="DEFERRED")
+                    c.execute("PRAGMA journal_mode=WAL")
+                    c.execute("PRAGMA busy_timeout=60000")
+                    c.row_factory = sqlite3.Row
+                    yield c
+                    if c.in_transaction:
+                        c.commit()
+                return
             except sqlite3.OperationalError as e:
-                retry_count += 1
-                logger.warning(f"Database locked, retry {retry_count}/{max_retries}")
-                if retry_count >= max_retries:
-                    logger.error(f"Database locked after {max_retries} retries: {e}")
-                    if conn:
-                        conn.rollback()
-                        conn.close()
-                    time.sleep(2)
+                tries += 1
+                if tries >= max_retries: 
+                    logger.error(f"DB locked after {tries} retries: {e}")
                     raise
-                time.sleep(retry_count * 0.5)
-            except Exception as e:
-                logger.error(f"Database error: {e}")
-                if conn and conn.in_transaction:
-                    conn.rollback()
-                raise
+                time.sleep(0.5 * tries)
             finally:
-                if conn:
-                    try:
-                        conn.close()
-                    except:
-                        pass
-    
-    def init_database(self):
-        """Initialisation de la base de données"""
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS market_data (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        symbol TEXT NOT NULL,
-                        price REAL,
-                        change_24h REAL,
-                        volume_24h REAL,
-                        market_cap REAL,
-                        liquidations REAL,
-                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
-                
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS news_translated (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        title_fr TEXT,
-                        content_fr TEXT,
-                        importance TEXT,
-                        url TEXT,
-                        is_sent BOOLEAN DEFAULT FALSE,
-                        content_hash TEXT UNIQUE,
-                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
-                
-                cursor.execute('CREATE INDEX IF NOT EXISTS idx_news_sent ON news_translated(is_sent)')
-                cursor.execute('CREATE INDEX IF NOT EXISTS idx_news_importance ON news_translated(importance)')
-                
-                conn.commit()
-                logger.info("✅ Base de données initialisée avec succès")
-        except Exception as e:
-            logger.error(f"❌ Erreur initialisation DB: {e}")
+                if c:
+                    try: c.close()
+                    except: pass
 
-class DataProvider:
-    """Fournisseur de données crypto et forex avec APIs"""
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({'User-Agent': 'Mozilla/5.0'})
-    
-    async def get_crypto_data(self, symbol: str) -> Dict:
-        """Récupère les données crypto avec multiple APIs"""
+    def init(self):
         try:
-            # Essai 1: CoinGlass API pour liquidations
-            if COINGLASS_API_KEY and symbol == 'bitcoin':
-                try:
-                    headers = {'coinglassSecret': COINGLASS_API_KEY}
-                    url = 'https://open-api.coinglass.com/public/v2/liquidation/info'
-                    params = {'symbol': 'BTC'}
-                    response = self.session.get(url, headers=headers, params=params, timeout=5)
-                    if response.status_code == 200:
-                        liq_data = response.json()
-                        liquidations = liq_data.get('data', {}).get('h24Amount', 0)
-                except:
-                    liquidations = 0
-            else:
-                liquidations = 0
-            
-            # Essai 2: CoinGecko pour prix
-            gecko_ids = {
-                'bitcoin': 'bitcoin',
-                'ethereum': 'ethereum', 
-                'solana': 'solana'
-            }
-            
-            coin_id = gecko_ids.get(symbol, symbol)
-            url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true"
-            
-            response = self.session.get(url, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if coin_id in data:
-                    coin_data = data[coin_id]
-                    return {
-                        'price': coin_data.get('usd', 0),
-                        'change_24h': coin_data.get('usd_24h_change', 0),
-                        'volume_24h': coin_data.get('usd_24h_vol', 0),
-                        'market_cap': coin_data.get('usd_market_cap', 0),
-                        'liquidations': liquidations
-                    }
+            with self.conn() as c:
+                cur = c.cursor()
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS news_translated(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title_fr TEXT, content_fr TEXT, importance TEXT,
+                    url TEXT, is_sent BOOLEAN DEFAULT 0,
+                    content_hash TEXT UNIQUE, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )""")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_news_sent ON news_translated(is_sent)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_news_importance ON news_translated(importance)")
+                c.commit()
+            logger.info("✅ DB OK")
         except Exception as e:
-            logger.warning(f"Erreur API: {e}")
-        
-        # Valeurs par défaut
+            logger.exception("DB init error: %s", e)
+
+# ========= DATA =========
+class DataProvider:
+    def __init__(self):
+        self.s = requests.Session()
+        self.s.headers.update({"User-Agent":"Mozilla/5.0"})
+
+    def _get(self, url, **kw):
+        return self.s.get(url, timeout=kw.pop("timeout", 8), **kw)
+
+    async def crypto(self, sym: str) -> Dict:
+        """
+        Priorité: Binance 24h ticker (BTCUSDT/ETHUSDT/SOLUSDT)
+        Fallback: CoinGecko simple/price
+        """
+        map_binance = {"bitcoin":"BTCUSDT","ethereum":"ETHUSDT","solana":"SOLUSDT"}
+        symbol = map_binance.get(sym, "BTCUSDT")
+        # 1) Binance
+        try:
+            r = self._get("https://api.binance.com/api/v3/ticker/24hr", params={"symbol":symbol})
+            if r.status_code == 200:
+                j = r.json()
+                price = float(j["lastPrice"])
+                change = float(j["priceChangePercent"])
+                vol = float(j["quoteVolume"])
+                return {"price":price, "change_24h":change, "volume_24h":vol, "market_cap":0, "liquidations":0}
+        except Exception as e:
+            logger.debug(f"Binance fail {sym}: {e}")
+
+        # 2) CoinGecko
+        try:
+            gecko_id = {"bitcoin":"bitcoin","ethereum":"ethereum","solana":"solana"}.get(sym, sym)
+            r = self._get("https://api.coingecko.com/api/v3/simple/price",
+                          params={"ids":gecko_id,"vs_currencies":"usd",
+                                  "include_24hr_change":"true","include_24hr_vol":"true","include_market_cap":"true"})
+            if r.status_code == 200:
+                d = r.json().get(gecko_id, {})
+                return {
+                    "price": d.get("usd", 0.0),
+                    "change_24h": d.get("usd_24h_change", 0.0),
+                    "volume_24h": d.get("usd_24h_vol", 0.0),
+                    "market_cap": d.get("usd_market_cap", 0.0),
+                    "liquidations": 0
+                }
+        except Exception as e:
+            logger.debug(f"Gecko fail {sym}: {e}")
+
+        # 3) défauts
         defaults = {
-            'bitcoin': {'price': 98500, 'change': 2.3, 'volume': 28_500_000_000, 'mcap': 1_950_000_000_000, 'liq': 125},
-            'ethereum': {'price': 3850, 'change': 1.8, 'volume': 16_200_000_000, 'mcap': 465_000_000_000, 'liq': 89},
-            'solana': {'price': 195, 'change': 3.5, 'volume': 3_800_000_000, 'mcap': 89_000_000_000, 'liq': 45}
+            "bitcoin": (98500, 2.3, 28_500_000_000, 0, 0),
+            "ethereum": (3850, 1.8, 16_200_000_000, 0, 0),
+            "solana": (195, 3.5, 3_800_000_000, 0, 0),
         }
-        
-        default = defaults.get(symbol, defaults['bitcoin'])
-        return {
-            'price': default['price'],
-            'change_24h': default['change'],
-            'volume_24h': default['volume'],
-            'market_cap': default['mcap'],
-            'liquidations': default['liq']
-        }
-    
-    async def get_eurusd_data(self) -> Dict:
-        """Données EUR/USD via Alpha Vantage"""
+        p,c,v,m,l = defaults.get(sym, defaults["bitcoin"])
+        return {"price":p,"change_24h":c,"volume_24h":v,"market_cap":m,"liquidations":l}
+
+    async def eurusd(self) -> Dict:
         try:
             if ALPHA_VANTAGE_KEY:
-                url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency=EUR&to_currency=USD&apikey={ALPHA_VANTAGE_KEY}"
-                response = self.session.get(url, timeout=5)
-                if response.status_code == 200:
-                    data = response.json()
-                    if 'Realtime Currency Exchange Rate' in data:
-                        rate_data = data['Realtime Currency Exchange Rate']
-                        return {
-                            'rate': float(rate_data.get('5. Exchange Rate', 1.0785)),
-                            'change_24h': float(rate_data.get('9. Change Percent', '0.15').replace('%', ''))
-                        }
-        except:
-            pass
-        
-        return {'rate': 1.0785, 'change_24h': 0.15}
-    
-    async def get_gold_data(self) -> Dict:
-        """Données Gold"""
-        return {'price': 2650.50, 'change_24h': 0.85}
-
-class ReportGenerator:
-    """Générateur de rapports"""
-    def __init__(self):
-        self.data_provider = DataProvider()
-    
-    async def generate_crypto_report(self) -> str:
-        """Génère un rapport crypto groupé avec liquidations"""
-        try:
-            btc = await self.data_provider.get_crypto_data('bitcoin')
-            eth = await self.data_provider.get_crypto_data('ethereum')
-            sol = await self.data_provider.get_crypto_data('solana')
-            
-            total_liq = btc['liquidations'] + eth['liquidations'] + sol['liquidations']
-            
-            report = f"""📊 **RAPPORT CRYPTO - {datetime.now().strftime('%d/%m/%Y %H:%M')}**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🟠 **BITCOIN**
-• Prix: ${btc['price']:,.0f}
-• 24h: {btc['change_24h']:+.2f}%
-• Volume: ${btc['volume_24h']/1_000_000_000:.1f}B
-• Liquidations: ${btc['liquidations']:.0f}M
-
-🔷 **ETHEREUM**  
-• Prix: ${eth['price']:,.0f}
-• 24h: {eth['change_24h']:+.2f}%
-• Volume: ${eth['volume_24h']/1_000_000_000:.1f}B
-• Liquidations: ${eth['liquidations']:.0f}M
-
-🟣 **SOLANA**
-• Prix: ${sol['price']:,.2f}
-• 24h: {sol['change_24h']:+.2f}%
-• Volume: ${sol['volume_24h']/1_000_000_000:.1f}B
-• Liquidations: ${sol['liquidations']:.0f}M
-
-📈 **ANALYSE GLOBALE:**
-• Tendance: {"🟢 Haussier" if (btc['change_24h'] + eth['change_24h'] + sol['change_24h'])/3 > 0 else "🔴 Baissier"}
-• Total liquidations 24h: ${total_liq:.0f}M
-• {"⚠️ Forte volatilité" if total_liq > 200 else "✅ Marché stable"}"""
-            
-            return report
-            
+                r = self._get("https://www.alphavantage.co/query",
+                              params={"function":"CURRENCY_EXCHANGE_RATE","from_currency":"EUR","to_currency":"USD","apikey":ALPHA_VANTAGE_KEY},
+                              timeout=6)
+                if r.status_code == 200:
+                    j = r.json().get("Realtime Currency Exchange Rate", {})
+                    rate = float(j.get("5. Exchange Rate", 1.08))
+                    ch = j.get("9. Change Percent", "0%").replace("%","")
+                    try: ch = float(ch)
+                    except: ch = 0.0
+                    return {"rate":rate, "change_24h":ch}
         except Exception as e:
-            logger.error(f"Erreur génération rapport: {e}")
-            return "❌ Erreur génération rapport"
-    
-    async def generate_forex_report(self) -> str:
-        """Génère un rapport forex"""
-        try:
-            eurusd = await self.data_provider.get_eurusd_data()
-            gold = await self.data_provider.get_gold_data()
-            
-            report = f"""💱 **MARCHÉS TRADITIONNELS**
-━━━━━━━━━━━━━━━━━━━━━━━━
+            logger.debug(f"AV fail: {e}")
+        return {"rate":1.0785, "change_24h":0.15}
 
-💶 **EUR/USD**
-• Taux: {eurusd['rate']:.4f}
-• 24h: {eurusd['change_24h']:+.2f}%
+    async def gold(self) -> Dict:
+        # branche ta vraie API si tu veux un cours live
+        return {"price":2650.50, "change_24h":0.85}
 
-🥇 **GOLD**
-• Prix: ${gold['price']:,.2f}
-• 24h: {gold['change_24h']:+.2f}%"""
-            
-            return report
-            
-        except Exception as e:
-            logger.error(f"Erreur rapport forex: {e}")
-            return ""
-
+# ========= NEWS =========
 class NewsTranslator:
-    """Traducteur de news avec détection Trump et Éco"""
-    def __init__(self, db_manager):
-        self.db = db_manager
-        self.translator = GoogleTranslator(source='en', target='fr')
-    
-    def translate_text(self, text: str) -> str:
-        """Traduit un texte en français"""
-        if not text:
-            return ""
-        try:
-            if len(text) > 500:
-                text = text[:500] + "..."
-            translated = self.translator.translate(text)
-            return translated if translated else text
-        except Exception as e:
-            logger.warning(f"Erreur traduction: {e}")
-            return text
-    
-    def detect_importance(self, title: str, content: str) -> str:
-        """Détecte l'importance d'une news avec Trump et Éco"""
-        text = f"{title} {content}".lower()
-        
-        # Trump detection
-        trump_keywords = ['trump', 'donald trump', 'president trump']
-        urgent_keywords = ['breaking', 'urgent', 'flash', 'alert', 'just in', 'live']
-        
-        is_trump = any(keyword in text for keyword in trump_keywords)
-        is_urgent = any(keyword in text for keyword in urgent_keywords)
-        
-        if is_trump and is_urgent:
-            return 'TRUMP_ALERT'
-        
-        # Éco detection
-        eco_keywords = [
-            'fed', 'fomc', 'powell', 'federal reserve',
-            'ecb', 'bce', 'lagarde', 'european central bank',
-            'interest rate', 'rate decision', 'rate hike', 'rate cut',
-            'cpi', 'ppi', 'inflation data', 'nfp', 'employment'
-        ]
-        
-        if any(keyword in text for keyword in eco_keywords):
-            return 'ECO_ALERT'
-        
-        # Crypto important
-        crypto_keywords = [
-            'bitcoin', 'ethereum', 'solana', 'btc', 'eth', 'sol',
-            'sec', 'etf', 'regulation', 'hack', 'exploit', 'bankruptcy'
-        ]
-        
-        if any(keyword in text for keyword in crypto_keywords):
-            return 'HIGH'
-        
-        return 'MEDIUM'
-    
-    async def process_news(self, title: str, content: str, url: str):
-        """Traite et stocke une news"""
-        try:
-            content_hash = hashlib.md5(f"{title}{url}".encode()).hexdigest()
-            
-            with self.db.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                cursor.execute('SELECT id FROM news_translated WHERE content_hash = ?', (content_hash,))
-                if cursor.fetchone():
-                    return
-                
-                title_fr = self.translate_text(title)
-                content_fr = self.translate_text(content[:300])
-                importance = self.detect_importance(title, content)
-                
-                cursor.execute('''
-                    INSERT INTO news_translated (title_fr, content_fr, importance, url, content_hash)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (title_fr, content_fr, importance, url, content_hash))
-                
-                conn.commit()
-                
-                if importance == 'TRUMP_ALERT':
-                    logger.info(f"🚨 ALERTE TRUMP: {title_fr[:50]}...")
-                elif importance == 'ECO_ALERT':
-                    logger.info(f"📊 ALERTE ÉCO: {title_fr[:50]}...")
-                else:
-                    logger.info(f"📰 News ajoutée: {title_fr[:50]}... [{importance}]")
-                
-        except Exception as e:
-            logger.error(f"Erreur traitement news: {e}")
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+        self.tr = GoogleTranslator(source="en", target="fr")
 
+    def translate(self, txt: str) -> str:
+        if not txt: return ""
+        try:
+            t = txt if len(txt) <= 500 else txt[:500]+"..."
+            res = self.tr.translate(t)
+            return res or t
+        except Exception:
+            return txt
+
+    def importance(self, title: str, content: str) -> str:
+        t = f"{title} {content}".lower()
+
+        trump = any(k in t for k in ["trump","donald trump","president trump"])
+        urgent = any(k in t for k in ["breaking","urgent","just in","live"])
+        if trump and urgent: return "TRUMP_ALERT"
+
+        eco = any(k in t for k in [
+            "fed","fomc","powell","federal reserve","ecb","bce","lagarde",
+            "interest rate","rate decision","cpi","ppi","inflation","nfp","employment"
+        ])
+        if eco: return "ECO_ALERT"
+
+        institutions = [
+            "blackrock","microstrategy","grayscale","fidelity","ark invest","vanguard",
+            "goldman sachs","jpmorgan","jp morgan","morgan stanley",
+            "sec approves","etf inflow","etf outflow","spot etf","sec filing","s-1",
+        ]
+        if any(k in t for k in institutions): return "INSTITUTION_ALERT"
+
+        if any(k in t for k in ["bitcoin","ethereum","solana","btc","eth","sol","sec","etf","regulation","hack","exploit"]):
+            return "HIGH"
+        return "MEDIUM"
+
+    async def store(self, title: str, content: str, url: str):
+        try:
+            h = hashlib.md5(f"{title}{url}".encode()).hexdigest()
+            with self.db.conn() as c:
+                cur = c.cursor()
+                cur.execute("SELECT 1 FROM news_translated WHERE content_hash=?", (h,))
+                if cur.fetchone(): return
+                cur.execute("""
+                    INSERT INTO news_translated(title_fr,content_fr,importance,url,content_hash)
+                    VALUES(?,?,?,?,?)
+                """, (
+                    self.translate(title),
+                    self.translate(content[:300]),
+                    self.importance(title, content),
+                    url, h
+                ))
+                c.commit()
+        except Exception as e:
+            logger.exception("store news error: %s", e)
+
+# ========= TELEGRAM =========
 class TelegramPublisher:
-    """Publie les messages sur Telegram avec gestion ultra-robuste pour Render"""
-    def __init__(self, token: str, chat_id: int, db_manager):
+    def __init__(self, token: str, chat_id: int, db: DatabaseManager):
         request = HTTPXRequest(
-            connection_pool_size=40,
-            pool_timeout=60.0,
-            read_timeout=30.0,
-            write_timeout=30.0,
-            connect_timeout=30.0
+            connection_pool_size=80,   # ↑
+            pool_timeout=90.0,         # ↑
+            read_timeout=40.0,
+            write_timeout=40.0,
+            connect_timeout=40.0,
         )
         self.bot = Bot(token=token, request=request)
         self.chat_id = chat_id
-        self.db = db_manager
-        self.last_message_time = 0
-        self.min_delay = 2.0
-    
-    async def send_message_safe(self, text: str, parse_mode: str = 'Markdown'):
-        """Envoie un message avec retry robuste"""
-        max_retries = 3
-        retry_count = 0
-        
-        while retry_count < max_retries:
-            try:
-                current_time = time.time()
-                time_since_last = current_time - self.last_message_time
-                if time_since_last < self.min_delay:
-                    await asyncio.sleep(self.min_delay - time_since_last)
-                
-                await self.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=text,
-                    parse_mode=parse_mode,
-                    disable_web_page_preview=True
-                )
-                
-                self.last_message_time = time.time()
-                return True
-                
-            except Exception as e:
-                retry_count += 1
-                logger.warning(f"Erreur envoi message (tentative {retry_count}/{max_retries}): {e}")
-                
-                if "Pool timeout" in str(e) or "Connection pool" in str(e):
-                    await asyncio.sleep(5)
-                else:
-                    await asyncio.sleep(retry_count * 2)
-                
-                if retry_count >= max_retries:
-                    logger.error(f"Échec envoi après {max_retries} tentatives")
-                    return False
-        
-        return False
-    
-    async def send_daily_report(self):
-        """Envoie le rapport quotidien avec message d'optimisation"""
-        try:
-            report_gen = ReportGenerator()
-            
-            # Message d'intro avec optimisations
-            intro = f"""🚀 **BOT CRYPTO V4.0 - RAPPORT QUOTIDIEN**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        self.db = db
+        self.min_delay = 1.8
+        self._last = 0.0
 
-⏰ {datetime.now().strftime('%d/%m/%Y à %H:%M')}
+    async def send(self, text: str, parse_mode: str = "HTML") -> bool:
+        # Séquence unique → évite le “Pool timeout”
+        async with send_lock:
+            # petit spacing anti-flood
+            now = time.time()
+            if now - self._last < self.min_delay:
+                await asyncio.sleep(self.min_delay - (now - self._last))
+            tries = 0
+            while tries < 3:
+                try:
+                    await self.bot.send_message(self.chat_id, text, parse_mode=parse_mode, disable_web_page_preview=True)
+                    self._last = time.time()
+                    return True
+                except Exception as e:
+                    tries += 1
+                    logger.warning(f"Send fail ({tries}/3): {e}")
+                    await asyncio.sleep(2 * tries)
+            logger.error("❌ Envoi abandonné après 3 essais")
+            return False
 
-📊 **OPTIMISATIONS:**
-• 📈 Rapports groupés (3 messages max)
-• ✅ Trump: Alerte immédiate 24/7
-• 📉 Événements éco: Alertes rapides 24/7
-• 📰 News: Mode adaptatif jour/nuit
-• 💓 Ping adaptatif: 5min jour, 10min nuit
-• 🌙 Mode réduit: Nuit + weekend
+# ========= REPORTS =========
+class ReportGenerator:
+    def __init__(self):
+        self.dp = DataProvider()
 
-🚨 **ALERTES PRIORITAIRES ACTIVES:**
-• Trump speaks/press → Immédiat (24/7)
-• Fed/BCE decisions → Rapide (24/7)
-• CPI/NFP/FOMC → Rapide (24/7)
+    async def crypto(self) -> str:
+        btc, eth, sol = await self.dp.crypto("bitcoin"), await self.dp.crypto("ethereum"), await self.dp.crypto("solana")
+        trend = "🟢 Haussier" if (btc["change_24h"]+eth["change_24h"]+sol["change_24h"])/3 > 0 else "🔴 Baissier"
+        def b(x): return f"{x/1_000_000_000:.1f}B"
+        return (
+            f"<b>📊 RAPPORT CRYPTO — {datetime.now().strftime('%d/%m/%Y %H:%M')}</b>\n"
+            f"────────────────────────────────\n\n"
+            f"🟠 <b>BITCOIN</b>\n"
+            f"• Prix : <b>${btc['price']:,.0f}</b>\n"
+            f"• 24h : <b>{btc['change_24h']:+.2f}%</b>\n"
+            f"• Volume : ${b(btc['volume_24h'])}\n\n"
+            f"🔷 <b>ETHEREUM</b>\n"
+            f"• Prix : <b>${eth['price']:,.0f}</b>\n"
+            f"• 24h : <b>{eth['change_24h']:+.2f}%</b>\n"
+            f"• Volume : ${b(eth['volume_24h'])}\n\n"
+            f"🟣 <b>SOLANA</b>\n"
+            f"• Prix : <b>${sol['price']:,.2f}</b>\n"
+            f"• 24h : <b>{sol['change_24h']:+.2f}%</b>\n"
+            f"• Volume : ${b(sol['volume_24h'])}\n\n"
+            f"📈 <b>Analyse</b> : {trend}"
+        )
 
-🔥 **PROCHAINS RAPPORTS GROUPÉS: 8h00 DEMAIN**
-📊 **SURVEILLANCE TRUMP 24/7 ACTIVE !**"""
-            
-            await self.send_message_safe(intro)
-            await asyncio.sleep(3)
-            
-            crypto_report = await report_gen.generate_crypto_report()
-            await self.send_message_safe(crypto_report)
-            await asyncio.sleep(3)
-            
-            if datetime.now().weekday() < 5:
-                forex_report = await report_gen.generate_forex_report()
-                if forex_report:
-                    await self.send_message_safe(forex_report)
-            
-            logger.info("✅ Rapport quotidien envoyé")
-            
-        except Exception as e:
-            logger.error(f"Erreur envoi rapport: {e}")
-    
-    async def send_priority_news(self):
-        """Envoie les alertes Trump et Éco"""
-        try:
-            with self.db.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Trump alerts
-                cursor.execute('''
-                    SELECT id, title_fr, content_fr
-                    FROM news_translated 
-                    WHERE is_sent = FALSE AND importance = 'TRUMP_ALERT'
-                    ORDER BY timestamp DESC LIMIT 1
-                ''')
-                
-                trump_news = cursor.fetchone()
-                
-                if trump_news:
-                    news_id, title, content = trump_news
-                    
-                    message = f"""🚨🚨🚨 **TRUMP ALERT** 🚨🚨🚨
-━━━━━━━━━━━━━━━━━━━━━━━━━
+    async def forex(self) -> str:
+        fx, au = await self.dp.eurusd(), await self.dp.gold()
+        return (
+            f"<b>💱 MARCHÉS TRADITIONNELS</b>\n"
+            f"──────────────────────────\n\n"
+            f"💶 <b>EUR/USD</b>\n"
+            f"• Taux : <b>{fx['rate']:.4f}</b>\n"
+            f"• 24h : <b>{fx['change_24h']:+.2f}%</b>\n\n"
+            f"🥇 <b>OR</b>\n"
+            f"• Prix : <b>${au['price']:,.2f}</b>\n"
+            f"• 24h : <b>{au['change_24h']:+.2f}%</b>"
+        )
 
-🔴 {title}
-
-📝 {content[:200]}...
-
-⏰ {datetime.now().strftime('%H:%M')} Paris
-
-💥 Impact possible sur BTC et marchés US !"""
-                    
-                    if await self.send_message_safe(message):
-                        cursor.execute('UPDATE news_translated SET is_sent = TRUE WHERE id = ?', (news_id,))
-                        conn.commit()
-                        logger.info(f"🚨 Alerte Trump envoyée")
-                
-                # Eco alerts
-                cursor.execute('''
-                    SELECT id, title_fr, content_fr
-                    FROM news_translated 
-                    WHERE is_sent = FALSE AND importance = 'ECO_ALERT'
-                    ORDER BY timestamp DESC LIMIT 1
-                ''')
-                
-                eco_news = cursor.fetchone()
-                
-                if eco_news:
-                    news_id, title, content = eco_news
-                    
-                    message = f"""📊 **ÉVÉNEMENT ÉCONOMIQUE MAJEUR**
-━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📈 {title}
-
-📝 {content[:200]}...
-
-⏰ {datetime.now().strftime('%H:%M')} Paris"""
-                    
-                    if await self.send_message_safe(message):
-                        cursor.execute('UPDATE news_translated SET is_sent = TRUE WHERE id = ?', (news_id,))
-                        conn.commit()
-                        logger.info(f"📊 Alerte éco envoyée")
-                
-        except Exception as e:
-            logger.error(f"Erreur envoi news prioritaires: {e}")
-    
-    async def send_grouped_news(self):
-        """Envoie les news groupées"""
-        try:
-            with self.db.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                cursor.execute('''
-                    SELECT id, title_fr, content_fr
-                    FROM news_translated 
-                    WHERE is_sent = FALSE AND importance IN ('HIGH', 'MEDIUM')
-                    ORDER BY timestamp DESC LIMIT 3
-                ''')
-                
-                news_items = cursor.fetchall()
-                
-                if news_items:
-                    message = "📰 **CRYPTO NEWS DIGEST**\n"
-                    message += "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    
-                    for i, (news_id, title, content) in enumerate(news_items, 1):
-                        title_short = title[:100] + "..." if len(title) > 100 else title
-                        content_short = content[:150] + "..." if len(content) > 150 else content
-                        
-                        message += f"📌 **{i}.** {title_short}\n"
-                        message += f"{content_short}\n\n"
-                        
-                        cursor.execute('UPDATE news_translated SET is_sent = TRUE WHERE id = ?', (news_id,))
-                    
-                    message += f"⏰ Compilé: {datetime.now().strftime('%H:%M')} - {len(news_items)} news"
-                    
-                    if await self.send_message_safe(message):
-                        conn.commit()
-                        logger.info(f"✅ {len(news_items)} news groupées envoyées")
-                
-        except Exception as e:
-            logger.error(f"Erreur envoi news groupées: {e}")
-
+# ========= CORE =========
 class CryptoBot:
-    """Bot principal"""
     def __init__(self):
         self.db = DatabaseManager()
-        self.translator = NewsTranslator(self.db)
-        self.publisher = TelegramPublisher(TOKEN, CHAT_ID, self.db)
-        self.running = True
-    
+        self.news = NewsTranslator(self.db)
+        self.pub = TelegramPublisher(TOKEN, CHAT_ID, self.db)
+        self.dp = DataProvider()
+        self.rg = ReportGenerator()
+
     async def fetch_news(self):
-        """Récupère les news depuis les flux RSS"""
-        sources = [
+        feeds = [
             'https://cointelegraph.com/rss',
             'https://www.coindesk.com/arc/outboundfeeds/rss/',
             'https://cryptonews.com/news/feed/',
             'https://feeds.reuters.com/reuters/topNews',
-            'https://rss.cnn.com/rss/edition.rss'
+            'https://rss.cnn.com/rss/edition.rss',
         ]
-        
-        for source in sources:
+        for f in feeds:
             try:
-                feed = feedparser.parse(source)
-                
-                limit = 3 if 'reuters' in source or 'cnn' in source else 5
-                
-                for entry in feed.entries[:limit]:
-                    title = entry.get('title', '')
-                    content = entry.get('summary', entry.get('description', ''))
-                    url = entry.get('link', '')
-                    
-                    if title:
-                        await self.translator.process_news(title, content, url)
-                
-                await asyncio.sleep(1)
-                
+                feed = feedparser.parse(f)
+                limit = 3 if ('reuters' in f or 'cnn' in f) else 5
+                for e in feed.entries[:limit]:
+                    await self.news.store(
+                        e.get("title",""),
+                        e.get("summary", e.get("description","")),
+                        e.get("link","")
+                    )
+                await asyncio.sleep(0.5)
             except Exception as e:
-                logger.error(f"Erreur fetch {source}: {e}")
-    
-    async def news_cycle(self):
-        """Cycle complet de traitement des news"""
+                logger.warning(f"Feed fail {f}: {e}")
+
+    async def push_priority_news(self):
         try:
-            await self.fetch_news()
-            await self.publisher.send_priority_news()
-            await self.publisher.send_grouped_news()
+            with self.db.conn() as c:
+                cur = c.cursor()
+                for tag, label, icon in [
+                    ("TRUMP_ALERT", "TRUMP ALERT", "🚨"),
+                    ("ECO_ALERT", "ÉVÉNEMENT ÉCO", "📊"),
+                    ("INSTITUTION_ALERT", "INSTITUTIONNEL", "🏦"),
+                ]:
+                    cur.execute("""SELECT id,title_fr,content_fr FROM news_translated
+                                   WHERE is_sent=0 AND importance=? ORDER BY timestamp DESC LIMIT 1""",(tag,))
+                    row = cur.fetchone()
+                    if not row: continue
+                    mid, title, content = row
+                    msg = (
+                        f"{icon} <b>{label}</b>\n"
+                        f"────────────────────────\n\n"
+                        f"• {title}\n\n"
+                        f"{content[:220]}...\n\n"
+                        f"⏰ {datetime.now().strftime('%H:%M')} Paris"
+                    )
+                    if await self.pub.send(msg):
+                        cur.execute("UPDATE news_translated SET is_sent=1 WHERE id=?", (mid,))
+                        c.commit()
         except Exception as e:
-            logger.error(f"Erreur cycle news: {e}")
+            logger.exception("priority news error: %s", e)
 
-# === FONCTIONS PRINCIPALES ===
+    async def push_digest(self):
+        try:
+            with self.db.conn() as c:
+                cur = c.cursor()
+                cur.execute("""SELECT id,title_fr,content_fr FROM news_translated
+                               WHERE is_sent=0 AND importance IN ('HIGH','MEDIUM')
+                               ORDER BY timestamp DESC LIMIT 3""")
+                rows = cur.fetchall()
+                if not rows: return
+                msg = "<b>📰 CRYPTO NEWS DIGEST</b>\n────────────────────────\n\n"
+                for i,(mid,title,content) in enumerate(rows,1):
+                    t = title if len(title)<=110 else title[:110]+"…"
+                    ct = content if len(content)<=160 else content[:160]+"…"
+                    msg += f"• <b>{i}.</b> {t}\n{ct}\n\n"
+                    cur.execute("UPDATE news_translated SET is_sent=1 WHERE id=?", (mid,))
+                msg += f"⏰ Compilé {datetime.now().strftime('%H:%M')} — {len(rows)} news"
+                if await self.pub.send(msg):
+                    c.commit()
+        except Exception as e:
+            logger.exception("digest error: %s", e)
 
-def run_daily_report():
-    """Lance le rapport quotidien"""
-    global bot_instance, dernier_rapport_envoye
-    
-    try:
-        aujourd_hui = datetime.now().date()
-        if dernier_rapport_envoye == aujourd_hui:
-            return
-        
-        if not bot_instance:
-            bot_instance = CryptoBot()
-        
-        asyncio.run(bot_instance.publisher.send_daily_report())
-        dernier_rapport_envoye = aujourd_hui
-        logger.info("✅ Rapport quotidien exécuté")
-        
-    except Exception as e:
-        logger.error(f"Erreur rapport: {e}")
+    async def send_daily_report(self):
+        intro = (
+            f"✅ <b>BOT CRYPTO V4.1 — DÉMARRAGE</b>\n"
+            f"────────────────────────────────\n\n"
+            f"⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')} — Système opérationnel\n"
+            f"• Rapports groupés\n• Alertes Trump/Éco/Institutions\n• Scan news intelligent"
+        )
+        await self.pub.send(intro)
+        await asyncio.sleep(1.5)
+        await self.pub.send(await self.rg.crypto()))
+        await asyncio.sleep(1.5)
+        await self.pub.send(await self.rg.forex())
 
-def run_news_cycle():
-    """Lance un cycle de news"""
+    async def news_cycle(self):
+        await self.fetch_news()
+        await self.push_priority_news()
+        await self.push_digest()
+
+# ========= SCHEDULER =========
+import schedule
+
+def run_async(coro):
+    # Utilitaire pour exécuter une coroutine de façon sûre (une seule boucle à la fois)
+    asyncio.run(coro)
+
+def job_daily_report():
+    global bot_instance, last_report_date
+    with job_lock:  # évite chevauchements avec d'autres jobs
+        try:
+            today = datetime.now().date()
+            if last_report_date == today: return
+            if bot_instance is None: 
+                logger.error("Bot non initialisé")
+                return
+            run_async(bot_instance.send_daily_report())
+            last_report_date = today
+        except Exception as e:
+            logger.exception("daily report job: %s", e)
+
+def job_news_cycle():
     global bot_instance
-    
-    try:
-        if not bot_instance:
-            bot_instance = CryptoBot()
-        
-        asyncio.run(bot_instance.news_cycle())
-        
-    except Exception as e:
-        logger.error(f"Erreur news: {e}")
+    with job_lock:
+        try:
+            if bot_instance is None:
+                logger.error("Bot non initialisé")
+                return
+            run_async(bot_instance.news_cycle())
+        except Exception as e:
+            logger.exception("news job: %s", e)
 
+# ========= KEEP-ALIVE / FLASK =========
 def keep_alive():
-    """Maintient le service actif sur Render avec ping intelligent"""
-    render_url = os.environ.get('RENDER_EXTERNAL_URL')
-    if render_url:
-        if not render_url.startswith('http'):
-            render_url = f"https://{render_url}"
-        
-        consecutive_fails = 0
-        while True:
-            try:
-                response = requests.get(f"{render_url}/status", timeout=10)
-                if response.status_code == 200:
-                    consecutive_fails = 0
-                    logger.debug("Keep-alive OK")
-                else:
-                    consecutive_fails += 1
-                    logger.warning(f"Keep-alive status: {response.status_code}")
-            except Exception as e:
-                consecutive_fails += 1
-                logger.warning(f"Keep-alive failed ({consecutive_fails}): {e}")
-            
-            if consecutive_fails > 3:
-                time.sleep(600)
-            else:
-                time.sleep(300)
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url: return
+    if not url.startswith("http"): url = "https://" + url
+    s = requests.Session()
+    fails = 0
+    while True:
+        try:
+            r = s.get(f"{url}/status", timeout=8)
+            fails = 0 if r.status_code == 200 else fails + 1
+        except Exception:
+            fails += 1
+        time.sleep(600 if fails>2 else 300)
 
 def run_flask():
-    """Lance Flask"""
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
 
+# ========= MAIN =========
 def main():
-    """Point d'entrée principal"""
     global bot_instance
-    
+    os.environ["TZ"] = "Europe/Paris"
+
+    # threads services
+    threading.Thread(target=run_flask, daemon=True).start()
+    threading.Thread(target=keep_alive, daemon=True).start()
+
+    # instance unique du bot
+    bot_instance = CryptoBot()
+
+    # message de démarrage
     try:
-        os.environ['TZ'] = 'Europe/Paris'
-        
-        # Lance Flask en arrière-plan
-        flask_thread = threading.Thread(target=run_flask, daemon=True)
-        flask_thread.start()
-        
-        # Lance le keep-alive
-        alive_thread = threading.Thread(target=keep_alive, daemon=True)
-        alive_thread.start()
-        
-        # Programme les tâches
-        schedule.every().day.at("08:00").do(run_daily_report)
-        schedule.every().day.at("20:00").do(run_daily_report)
-        schedule.every(2).hours.do(run_news_cycle)
-        schedule.every(30).minutes.do(run_news_cycle)  # Check plus fréquent pour Trump/Éco
-        
-        logger.info("✅ Bot démarré avec succès")
-        
-        # Message de démarrage avec optimisations
-        bot_instance = CryptoBot()
-        startup_msg = f"""✅ **BOT CRYPTO V4.0 - DÉMARRÉ**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🟢 Système opérationnel
-⏰ {datetime.now().strftime('%d/%m/%Y à %H:%M')}
-
-📊 **OPTIMISATIONS:**
-• 📈 Rapports groupés (3 messages max)
-• ✅ Trump: Alerte immédiate 24/7
-• 📉 Événements éco: Alertes rapides 24/7
-• 📰 News: Mode adaptatif jour/nuit
-• 💓 Ping adaptatif: 5min jour, 10min nuit
-• 🌙 Mode réduit: Nuit + weekend
-
-🚨 **ALERTES PRIORITAIRES ACTIVES:**
-• Trump speaks/press → Immédiat (24/7)
-• Fed/BCE decisions → Rapide (24/7)
-• CPI/NFP/FOMC → Rapide (24/7)
-
-📊 Rapports programmés: 8h00 et 20h00
-📰 Scan des news: toutes les 30 min
-🔥 **SURVEILLANCE TRUMP 24/7 ACTIVE !**"""
-        
-        asyncio.run(bot_instance.publisher.send_message_safe(startup_msg))
-        
-        # Boucle principale
-        while True:
-            schedule.run_pending()
-            time.sleep(30)
-            
-    except KeyboardInterrupt:
-        logger.info("Arrêt du bot")
+        run_async(bot_instance.pub.send("🟢 <b>BOT DÉMARRÉ</b> — Surveillance active"))
     except Exception as e:
-        logger.error(f"Erreur critique: {e}")
-        time.sleep(60)
-        main()
+        logger.warning("Start message fail: %s", e)
+
+    # planification
+    schedule.every().day.at("08:00").do(job_daily_report)
+    schedule.every().day.at("20:00").do(job_daily_report)
+    schedule.every(2).hours.do(job_news_cycle)
+    schedule.every(30).minutes.do(job_news_cycle)
+
+    logger.info("✅ Scheduler prêt")
+    while True:
+        schedule.run_pending()
+        time.sleep(10)
 
 if __name__ == "__main__":
     main()
+
