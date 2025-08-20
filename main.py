@@ -392,7 +392,7 @@ class CryptoBot:
         )
         await self.pub.send(intro)
         await asyncio.sleep(1.5)
-       await self.pub.send(await self.rg.crypto())
+        await self.pub.send(await self.rg.crypto())
         await asyncio.sleep(1.5)
         await self.pub.send(await self.rg.forex())
 
@@ -482,5 +482,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
