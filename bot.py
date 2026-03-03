@@ -8,9 +8,9 @@ from binance.client import Client
 import datetime
 
 # Variables d'environnement (ajoute-les sur Render Dashboard !)
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-BINANCE_KEY = os.getenv("BINANCE_KEY")
-BINANCE_SECRET = os.getenv("BINANCE_SECRET")
+BOT_TOKEN = os.getenv("8695042227:AAGvg25FY4dnRGLgZuheEKnXq9_v6QRILXM")
+BINANCE_KEY = os.getenv("sFC9TfhWwPNQyPsnEGfNycajpGbiGrEr31XmdJlxE3Fde6JaoZJJFjQQWE2osi4k")
+BINANCE_SECRET = os.getenv("1C7Lw2q4c8OekUZ7tI3NTJcstJSNzj7fx8DSp9A2AaQxOY5yPKdiIJ2WbUpEXjCT")
 
 if not all([BOT_TOKEN, BINANCE_KEY, BINANCE_SECRET]):
     raise ValueError("Variables manquantes : BOT_TOKEN, BINANCE_KEY, BINANCE_SECRET sur Render")
